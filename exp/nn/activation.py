@@ -78,7 +78,7 @@ def to_norm_activation_fn(activation_fn=None, num_samples=16384, device=None, dt
 
 class NormActivationWrapper(nn.Module):
 
-    def __init__(self, activation: nn.Module, init_samples: Optional[int] = 1024, init_sampler: Optional[str] = 'normal', can_optimize: bool = True):
+    def __init__(self, activation: nn.Module, init_samples: Optional[int] = None, init_sampler: Optional[str] = 'normal', can_optimize: bool = True):
         super().__init__()
         # save the activation
         assert isinstance(activation, nn.Module), f'activation is not an instance of nn.Module, got: {type(activation)}'
@@ -123,6 +123,19 @@ class NormActivationWrapper(nn.Module):
         activation = getattr(self._activation, '__name__', self._activation)
         return f'{self.__class__.__name__}(activation={activation}, can_optimize={self.can_optimize})'
 
+    def freeze(self):
+        try:
+            mean = self.get_parameter('_mean')
+            std = self.get_parameter('_std')
+            # delete parameters
+            del self._mean
+            del self._std
+            # register as buffer instead
+            self.register_buffer('_mean', mean.requires_grad_(False), persistent=True)
+            self.register_buffer('_std', std.requires_grad_(False), persistent=True)
+        except AttributeError:
+            pass
+
     @property
     def values(self):
         return [self._mean.item(), self._std.item()]
@@ -139,6 +152,11 @@ class NormActivationWrapper(nn.Module):
 
         model.apply(_collect)
         return layers
+
+    @classmethod
+    def recursive_freeze(cls, model: nn.Module):
+        for layer in cls.recursive_get_from_module(model):
+            layer.freeze()
 
 
 # ========================================================================= #
@@ -197,7 +215,7 @@ ACTIVATION_CLASSES = {
 }
 
 
-def NormActivation(activation: str = 'norm_tanh', norm_samples: int = 1024, norm_sampler: str = 'normal') -> NormActivationWrapper:
+def NormActivation(activation: str = 'norm_tanh', norm_samples: Optional[int] = None, norm_sampler: str = 'normal') -> NormActivationWrapper:
     # should normalise or not
     sample = False
     if activation.startswith('norm_'):
@@ -212,7 +230,7 @@ def NormActivation(activation: str = 'norm_tanh', norm_samples: int = 1024, norm
         return NormActivationWrapper(activation, init_samples=None,         init_sampler=None,         can_optimize=False)
 
 
-def NormActivationMaker(activation: str = 'norm_swish', norm_samples: int = 1024, norm_sampler: str = 'normal') -> Callable[[int, int, int], NormActivationWrapper]:
+def NormActivationMaker(activation: str = 'norm_swish', norm_samples: Optional[int] = None, norm_sampler: str = 'normal') -> Callable[[int, int, int], NormActivationWrapper]:
     return lambda i, inp, out: NormActivation(activation=activation, norm_samples=norm_samples, norm_sampler=norm_sampler)
 
 
