@@ -30,6 +30,7 @@ class SimpleSystem(pl.LightningModule):
         model_sizes: Sequence[int] = (28 * 28, 128, 32, 128, 28 * 28),
         model_activation: str = 'tanh',
         model_init_mode: str = 'xavier_normal',
+        model_batch_norm: bool = False,
         # optimizer
         lr: float = 1e-3,
         # normalising
@@ -50,9 +51,10 @@ class SimpleSystem(pl.LightningModule):
         self.hparams.hidden_end_size = self.hparams.model_sizes[-2]
         # make model
         self._base_model, _, self.title = make_normalized_model(
-            sizes=model_sizes,
-            activation=model_activation,
-            init_mode=model_init_mode,
+            model_sizes=model_sizes,
+            model_activation=model_activation,
+            model_init_mode=model_init_mode,
+            model_batch_norm=model_batch_norm,
             test_steps=128,
             test_batch_size=32,
             norm_samples=norm_samples,
@@ -94,6 +96,7 @@ class SimpleSystem(pl.LightningModule):
         model_hidden_sizes: Sequence[int] = (128, 32, 128),
         model_activation: str = 'tanh',
         model_init_mode: str = 'xavier_normal',
+        model_batch_norm: bool = False,
         # optimizer
         lr: float = 1e-3,
         # normalising
@@ -114,6 +117,7 @@ class SimpleSystem(pl.LightningModule):
             model_sizes=[28*28, *model_hidden_sizes, 28*28],
             model_activation=model_activation,
             model_init_mode=model_init_mode,
+            model_batch_norm=model_batch_norm,
             lr=lr,
             norm_samples=norm_samples,
             norm_sampler=norm_sampler,

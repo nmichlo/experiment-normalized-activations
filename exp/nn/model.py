@@ -150,6 +150,8 @@ def make_sequential_nn(
     init_mode='default',
     norm_samples: Optional[int] = None,  # ignored if `activations` is not a string
     norm_sampler: str = 'normal',        # ignored if `activations` is not a string
+    # add batch norm layers
+    batch_norm: Union[bool, int] = False,
 ) -> nn.Module:
     """
     activation can be a `str` or `Callable[[int, int, int], nn.Module]`
@@ -158,18 +160,22 @@ def make_sequential_nn(
     # get activation maker
     if isinstance(activations, str):
         activations = NormActivationMaker(activations, norm_samples=norm_samples, norm_sampler=norm_sampler)
-    # make activations
-    if callable(activations):
-        acts = [activations(i, inp, out) for i, (inp, out) in enumerate(iter_pairs(sizes[:-1]))]
-    else:
-        acts = list(activations)
-    # make fully connected layers
-    linears = [nn.Linear(inp, out) for inp, out in iter_pairs(sizes)]
-    assert len(acts) == len(linears) - 1
-    # interleave layers
-    layers = [None] * (len(acts) + len(linears))
-    layers[0::2] = linears
-    layers[1::2] = acts
+    # get batch_norm
+    if batch_norm is True:
+        batch_norm = 1
+    # make layers
+    layers = []
+    for i, (inp, out) in enumerate(iter_pairs(sizes)):
+        layers.append(nn.Linear(inp, out))
+        print(f'layer: {i} {inp} {out}')
+        # dont add activation to last layer
+        if (i < len(sizes) - 2):
+            layers.append(activations(i, inp, out))
+            print(f'  - activation: {i} {inp} {out}')
+            # add batch norm every nth layer
+            if batch_norm and (i % batch_norm == 0):
+                layers.append(nn.BatchNorm1d(out, momentum=0.05))
+                print(f'    + batch_norm: {i} {inp} {out}')
     # make model
     model = nn.Sequential(*layers)
     # initialise
@@ -200,9 +206,10 @@ def normalize_model(
 
 
 def make_normalized_model(
-    sizes,
-    activation: str = 'norm_tanh',
-    init_mode='default',
+    model_sizes,
+    model_activation: str = 'norm_tanh',
+    model_init_mode='default',
+    model_batch_norm: bool = False,
     # test activations
     test_steps: int = 128,
     test_batch_size: int = 32,
@@ -220,17 +227,18 @@ def make_normalized_model(
 ) -> Union[nn.Module, Tuple[Any, ...]]:
     # make the model
     model = make_sequential_nn(
-        sizes,
-        activations=activation,
-        init_mode=init_mode,
+        model_sizes,
+        activations=model_activation,
+        init_mode=model_init_mode,
         norm_samples=norm_samples,
         norm_sampler=norm_sampler,
+        batch_norm=model_batch_norm,
     )
 
     # normalise the model
     model, (before_values, before_stats, after_values, after_stats, loss_hist) = normalize_model(
         model=model,
-        obs_shape=[sizes[0]],
+        obs_shape=[model_sizes[0]],
         test_steps=test_steps,
         test_batch_size=test_batch_size,
         norm_sampler=norm_sampler,
@@ -241,7 +249,7 @@ def make_normalized_model(
         norm_targets_std=norm_targets_std,
     )
     # print everything
-    title = f'{min(sizes):3d} {max(sizes):3d} {(len(sizes) - 1) // 2:3d} | {activation:18s} | {norm_sampler:15s} | {init_mode:15s}'
+    title = f'{min(model_sizes):3d} {max(model_sizes):3d} {(len(model_sizes) - 1) // 2:3d} | {model_activation:18s} | {norm_sampler:15s} | {model_init_mode:15s} | bn {str(model_batch_norm):5s}'
     if log:
         print_stats(before_stats,               title=f'{title} | BFR')
         print_stats(after_stats,                title=f'{title} | AFT')
