@@ -98,8 +98,8 @@ def norm_activations_optimize(
                 targ_means, targ_stds = _make_targets_for(storage, means, stds, targets_mean, targets_std)
                 # compute loss
                 loss_mean = F.mse_loss(means, targ_means).mean()
-                loss_std = F.mse_loss(stds, targ_stds).mean()
-                loss = loss_mean + loss_std
+                loss_std  = F.mse_loss(stds, targ_stds).mean()
+                loss      = loss_mean + loss_std
                 # backpropagation
                 optimizer.zero_grad()
                 loss.backward()
@@ -167,15 +167,12 @@ def make_sequential_nn(
     layers = []
     for i, (inp, out) in enumerate(iter_pairs(sizes)):
         layers.append(nn.Linear(inp, out))
-        print(f'layer: {i} {inp} {out}')
         # dont add activation to last layer
         if (i < len(sizes) - 2):
             layers.append(activations(i, inp, out))
-            print(f'  - activation: {i} {inp} {out}')
             # add batch norm every nth layer
             if batch_norm and (i % batch_norm == 0):
                 layers.append(nn.BatchNorm1d(out, momentum=0.05))
-                print(f'    + batch_norm: {i} {inp} {out}')
     # make model
     model = nn.Sequential(*layers)
     # initialise
@@ -251,9 +248,10 @@ def make_normalized_model(
     # print everything
     title = f'{min(model_sizes):3d} {max(model_sizes):3d} {(len(model_sizes) - 1) // 2:3d} | {model_activation:18s} | {norm_sampler:15s} | {model_init_mode:15s} | bn {str(model_batch_norm):5s}'
     if log:
-        print_stats(before_stats,               title=f'{title} | BFR')
-        print_stats(after_stats,                title=f'{title} | AFT')
-        print_stats(before_values-after_values, title=f'{title} | DIF', centers=(0.0, 0.0), min_radius=(None, None))
+        print_stats(before_stats,  title=f'{title} | BFR: STAT')
+        print_stats(after_stats,   title=f'{title} | AFT: STAT')
+        print_stats(before_values, title=f'{title} | BFR: VALS')
+        print_stats(after_values,  title=f'{title} | AFT: VALS')
         print()
     # return the  optimized model and stats
     if stats:

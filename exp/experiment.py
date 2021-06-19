@@ -3,10 +3,10 @@ from typing import Optional
 from typing import Sequence
 from typing import Union
 
-import wandb
-from pytorch_lightning.loggers import WandbLogger
+import numpy as np
 import pytorch_lightning as pl
 import torch
+from pytorch_lightning.loggers import WandbLogger
 from torch import nn
 from torch.nn import functional as F
 
@@ -15,12 +15,12 @@ from exp.nn.model import get_ae_layer_sizes
 from exp.nn.model import make_normalized_model
 from exp.nn.model import norm_activations_analyse
 from exp.util.utils import plot_batch
+from exp.util.utils import print_stats
 
 
 # ========================================================================= #
 # Helper                                                                    #
 # ========================================================================= #
-from exp.util.utils import print_stats
 
 
 class SimpleSystem(pl.LightningModule):
@@ -134,7 +134,11 @@ class SimpleSystem(pl.LightningModule):
             max_epochs=epochs,
             weights_summary='full',
             checkpoint_callback=False,
-            logger=WandbLogger(name=wandb_name + re.sub(r'[\s|]+', '_', model.title).strip('_'), project='weight-init', tags=wandb_tags) if log_wandb else False,
+            logger=False if (not log_wandb) else WandbLogger(
+                name=(wandb_name + re.sub(r'[\s|]+', '_', model.title).strip('_')).lower(),
+                project='weight-init',
+                tags=wandb_tags
+            ),
             gpus=1 if torch.cuda.is_available() else 0,
         )
         trainer.fit(model, data)
@@ -147,8 +151,11 @@ class SimpleSystem(pl.LightningModule):
             # plot everything
             plot_batch(img_batch, out_batch, mean_std=data.norm_mean_std, clip=True)
         # print final stats
-        before_values, before_stats = norm_activations_analyse(model._base_model, obs_shape=[28*28], sampler=norm_sampler, steps=128, batch_size=32)
-        print_stats(before_stats, title=f'{model.title} | TRN')
+        train_values, train_stats = norm_activations_analyse(
+            model._base_model, obs_shape=[28 * 28], sampler=norm_sampler, steps=128, batch_size=32
+        )
+        print_stats(train_stats,  title=f'{model.title} | TRN STAT')
+        print_stats(train_values, title=f'{model.title} | TRN VALS')
         # FINISHED
         if log_wandb:
             import wandb
@@ -177,6 +184,33 @@ if __name__ == '__main__':
         wandb_name=WANDB_NAME,
         wandb_tags=WANDB_TAGS,
     )
+
+
+    # ===================================================================== #
+    # Generate Targets
+    # ===================================================================== #
+
+
+    def slope(a, n=len(LAYER_SIZES), y_0=0.001, y_n=1.0, zero_is_flat=False, tensor=True):
+        # check bounds
+        if not ((-1 < a < 0) or (0 < a < 1)):
+            raise ValueError('a must be in the range (-1, 0) or (0, 1)')
+        # scale slope values
+        if zero_is_flat:
+            # scale slope value -> 0 is flat
+            b = (1 / (1 - a)) if (a > 0) else (1 + a)
+        else:
+            # scale slope value -> 0 is sharp
+            b = (1 / a) if (a > 0) else (-a)
+        # compute values
+        x = np.arange(n, dtype='float32')
+        m = (y_n - y_0) / (b**(n - 1) - 1)
+        y = m * (b**x - 1) + y_0
+        # return values!
+        if tensor:
+            return torch.as_tensor(y, dtype=torch.float32)
+        return y
+
 
     # ===================================================================== #
     # TANH - BASE
