@@ -155,7 +155,10 @@ class SimpleSystem(pl.LightningModule):
         wandb_tags: Optional[Sequence[str]] = None,
         wandb_project: str = 'weight-init',
     ):
-        extra_hparams = {}
+        extra_hparams = dict(
+            epochs=epochs,
+            batch_size=batch_size,
+        )
 
         # normalise parameters & extend hparams if needed
         if isinstance(norm_targets_std, SlopeArgs):
