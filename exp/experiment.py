@@ -2,6 +2,7 @@ import dataclasses
 import re
 from typing import Optional
 from typing import Sequence
+from typing import Tuple
 from typing import Union
 
 import numpy as np
@@ -12,7 +13,7 @@ from pytorch_lightning.loggers import WandbLogger
 from torch import nn
 from torch.nn import functional as F
 
-from exp.data.mnist import MnistDataModule
+from exp.data import make_image_data_module
 from exp.nn.model import get_ae_layer_sizes
 from exp.nn.model import make_normalized_model
 from exp.nn.model import norm_activations_analyse
@@ -67,10 +68,11 @@ class SimpleSystem(pl.LightningModule):
 
     def __init__(
         self,
-        model_sizes: Sequence[int] = (28 * 28, 128, 32, 128, 28 * 28),
+        model_hidden_sizes: Sequence[int] = (128, 32, 128),
         model_activation: str = 'tanh',
         model_init_mode: str = 'xavier_normal',
         model_batch_norm: bool = False,
+        model_obs_shape: Tuple[int, int, int] = (1, 28, 28),
         # optimizer
         lr: float = 1e-3,
         # normalising
@@ -87,13 +89,13 @@ class SimpleSystem(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         # compute params
-        self.hparams.num_layers = len(self.hparams.model_sizes) - 1
-        self.hparams.hidden_beg_size = self.hparams.model_sizes[1]
-        self.hparams.hidden_mid_size = self.hparams.model_sizes[len(self.hparams.model_sizes)//2]
-        self.hparams.hidden_end_size = self.hparams.model_sizes[-2]
+        self.hparams.num_layers = len(self.hparams.model_hidden_sizes) + 1
+        self.hparams.hidden_beg_size = self.hparams.model_hidden_sizes[0]
+        self.hparams.hidden_mid_size = self.hparams.model_hidden_sizes[len(self.hparams.model_hidden_sizes)//2]
+        self.hparams.hidden_end_size = self.hparams.model_hidden_sizes[-1]
         # make model
         self._base_model, _, self.title = make_normalized_model(
-            model_sizes=model_sizes,
+            model_sizes=[np.prod(model_obs_shape), *model_hidden_sizes, np.prod(model_obs_shape)],
             model_activation=model_activation,
             model_init_mode=model_init_mode,
             model_batch_norm=model_batch_norm,
@@ -113,7 +115,7 @@ class SimpleSystem(pl.LightningModule):
         self._model = nn.Sequential(
             nn.Flatten(start_dim=1),
             self._base_model,
-            nn.Unflatten(dim=1, unflattened_size=(1, 28, 28)),
+            nn.Unflatten(dim=1, unflattened_size=model_obs_shape),
         )
 
     def forward(self, x):
@@ -132,6 +134,7 @@ class SimpleSystem(pl.LightningModule):
     def quick_mnist_train(
         cls,
         # trainer
+        dataset: str = 'mnist',
         epochs: int = 100,
         batch_size: int = 128,
         # model settings
@@ -156,6 +159,7 @@ class SimpleSystem(pl.LightningModule):
         wandb_project: str = 'weight-init',
     ):
         extra_hparams = dict(
+            dataset=dataset,
             epochs=epochs,
             batch_size=batch_size,
         )
@@ -174,12 +178,16 @@ class SimpleSystem(pl.LightningModule):
                 y_n=norm_targets_std.y_n,
             )
 
+        # get the data
+        data = make_image_data_module(dataset=dataset, batch_size=batch_size, normalise=True)
+
         # make the model
         model = cls(
-            model_sizes=[28 * 28, *model_hidden_sizes, 28 * 28],
+            model_hidden_sizes=model_hidden_sizes,
             model_activation=model_activation,
             model_init_mode=model_init_mode,
             model_batch_norm=model_batch_norm,
+            model_obs_shape=data.obs_shape,
             lr=lr,
             norm_samples=norm_samples,
             norm_sampler=norm_sampler,
@@ -191,9 +199,6 @@ class SimpleSystem(pl.LightningModule):
             # log extra hparams
             **extra_hparams,
         )
-
-        # get the data
-        data = MnistDataModule(batch_size=batch_size, normalise=True)
 
         # train the model
         trainer = pl.Trainer(
