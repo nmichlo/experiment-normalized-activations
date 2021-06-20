@@ -44,7 +44,7 @@ def _make_targets_for(storage: dict, means: torch.Tensor, stds: torch.Tensor, ta
     if isinstance(targets_mean, (float, int)):
         targets_mean = torch.full_like(means, fill_value=targets_mean, dtype=torch.float32)
     if isinstance(targets_std, (float, int)):
-        targets_std = torch.full_like(means, fill_value=targets_std, dtype=torch.float32)
+        targets_std = torch.full_like(stds, fill_value=targets_std, dtype=torch.float32)
     # check arrays
     assert targets_mean.shape == means.shape
     assert targets_std.shape == stds.shape
@@ -92,13 +92,14 @@ def norm_activations_optimize(
                 y = model(x)
                 # get outputs statistics
                 means = torch.stack([y.mean() for y in outputs], dim=0)
-                stds = torch.stack([y.std() for y in outputs], dim=0)
+                stds = torch.stack([y.std(unbiased=False) for y in outputs], dim=0)
+                # clear stack
                 outputs.clear()
                 # get targets
                 targ_means, targ_stds = _make_targets_for(storage, means, stds, targets_mean, targets_std)
                 # compute loss
-                loss_mean = F.mse_loss(means, targ_means).mean()
-                loss_std  = F.mse_loss(stds, targ_stds).mean()
+                loss_mean = F.mse_loss(means, targ_means)
+                loss_std  = F.mse_loss(stds, targ_stds)
                 loss      = loss_mean + loss_std
                 # backpropagation
                 optimizer.zero_grad()
@@ -130,7 +131,7 @@ def norm_activations_analyse(model, obs_shape, sampler='normal', steps=100, batc
                 # feed forward
                 y = model(x)
                 # save results
-                stats.append([[y.mean().item(), y.std().item()] for y in outputs])
+                stats.append([[y.mean().item(), y.std(unbiased=False).item()] for y in outputs])
                 outputs.clear()
             # get mean & std values
             values = np.array([m.values for m in layers], dtype='float32').T
