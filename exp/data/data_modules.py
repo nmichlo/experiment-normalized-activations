@@ -1,6 +1,8 @@
+import itertools
 import os
 import pickle
 import warnings
+from typing import Iterator
 from typing import Optional
 from typing import Sequence
 from typing import Tuple
@@ -12,13 +14,16 @@ import torch
 import torchvision
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
+from torch.utils.data import IterableDataset
 from torch.utils.data import random_split
+from torch.utils.data.dataset import T_co
 from torchvision.datasets import MNIST
 
 
 # ========================================================================= #
 # Helper                                                                    #
 # ========================================================================= #
+from exp.nn.activation import get_sampler
 
 
 def split_sizes(length, n):
@@ -110,23 +115,85 @@ class BaseImageModule(pl.LightningDataModule):
     def obs_size(self) -> int:
         return int(np.prod(self.img_shape))
 
+    def _make_dataloader(self, name, data):
+        if data is None:
+            raise ValueError(f'{name} was not initialised by: {self.__class__.__name__}.setup')
+        if isinstance(data, IterableDataset):
+            # WARNING: iterable dataset cannot make use of shuffle!
+            return DataLoader(dataset=data, batch_size=self._batch_size)
+        else:
+            return DataLoader(dataset=data, batch_size=self._batch_size, shuffle=self._shuffle)
+
     def train_dataloader(self):
-        if self._data_trn is None:
-            raise ValueError(f'data_trn was not initialised by: {self.__class__.__name__}.setup')
-        return DataLoader(dataset=self._data_trn, batch_size=self._batch_size, shuffle=self._shuffle)
+        return self._make_dataloader('data_trn', self._data_trn)
 
     def test_dataloader(self):
-        if self._data_tst is None:
-            raise ValueError(f'data_tst was not initialised by: {self.__class__.__name__}.setup')
-        return DataLoader(dataset=self._data_tst, batch_size=self._batch_size, shuffle=False)
+        return self._make_dataloader('data_tst', self._data_tst)
 
     def val_dataloader(self):
-        if self._data_val is None:
-            raise ValueError(f'data_val was not initialised by: {self.__class__.__name__}.setup')
-        return DataLoader(dataset=self._data_val, batch_size=self._batch_size, shuffle=False)
+        return self._make_dataloader('data_val', self._data_val)
 
-    def sample_display_batch(self, n=9, shuffle=False) -> torch.Tensor:
-        return next(iter(DataLoader(self._data_val, num_workers=0, batch_size=n, shuffle=shuffle)))
+    def sample_display_batch(self, n=9) -> torch.Tensor:
+        return next(iter(DataLoader(self._data_val, num_workers=0, batch_size=n, shuffle=False)))
+
+
+# ========================================================================= #
+# NOISE                                                                     #
+# ========================================================================= #
+
+
+class NoiseDataset(IterableDataset):
+
+    def __init__(
+        self,
+        obs_shape: Tuple[int, ...],
+        sampler: str = 'normal',
+        return_labels: bool = False,
+        num_labels: int = 2,
+        length: Optional[int] = 60000,
+    ):
+        self._sampler = get_sampler(sampler)
+        self._obs_shape = obs_shape
+        self._return_labels = return_labels
+        self._num_labels = num_labels
+        self._length = length
+
+    def __iter__(self) -> Iterator[torch.Tensor]:
+        counter = itertools.count() if (self._length is None) else range(self._length)
+        # yield all values!
+        for i in counter:
+            obs = self._sampler(*self._obs_shape, dtype=torch.float32, device=None)
+            if self._return_labels:
+                yield obs, np.random.randint(0, self._num_labels)
+            else:
+                yield obs
+
+
+class NoiseImageDataModule(BaseImageModule):
+
+    def __init__(
+        self,
+        obs_shape: Tuple[int, int, int] = (1, 28, 28),
+        sampler: str = 'normal',
+        batch_size: int = 128,
+        normalise: Union[bool, Tuple[float, float]] = False,
+        shuffle: bool = True,
+        num_workers: int = os.cpu_count(),
+        return_labels: bool = False,
+        num_labels: int = 2,
+        length: Optional[int] = 60000,
+    ):
+        super().__init__(batch_size=batch_size, normalise=normalise, shuffle=shuffle, num_workers=num_workers)
+        self._dataset = NoiseDataset(obs_shape=obs_shape, sampler=sampler, return_labels=return_labels, num_labels=num_labels, length=length)
+        C, H, W = obs_shape
+        self._img_shape = (H, W, C)
+
+    def _setup(self, transform) -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
+        return (self._dataset, self._dataset, self._dataset)
+
+    @property
+    def img_shape(self) -> Tuple[int, int, int]:
+        return self._img_shape
 
 
 # ========================================================================= #
@@ -184,7 +251,7 @@ class MnistDataModule(BaseImageModule):
 # ========================================================================= #
 
 
-class ImagenetMiniFile(Dataset):
+class ImageNetMiniFile(Dataset):
 
     def __init__(self, file: str, return_labels=False, transform=None, transform_label=None):
         self._file = file
@@ -236,7 +303,15 @@ class ImagenetMiniFile(Dataset):
         return img, label
 
 
-class ConcatImagenetMiniFiles(Dataset):
+class ConcatImageNetMiniFiles(Dataset):
+
+    """
+    mini-ImageNet:
+    https://github.com/yaoyao-liu/mini-imagenet-tools
+
+    DOWNLOAD LINKS:
+    https://drive.google.com/drive/folders/137M9jEv8nw0agovbUiEN_fPl_waJ2jIj
+    """
 
     FILE_NAME_TRN = 'mini-imagenet-cache-train.pkl'
     FILE_NAME_TST = 'mini-imagenet-cache-test.pkl'
@@ -248,9 +323,9 @@ class ConcatImagenetMiniFiles(Dataset):
         self._transform = transform
         self._transform_label = transform_label
         # load files ~ 2GB
-        dataset_trn = ImagenetMiniFile(os.path.join(self._data_dir, self.FILE_NAME_TRN))
-        dataset_tst = ImagenetMiniFile(os.path.join(self._data_dir, self.FILE_NAME_TST))
-        dataset_val = ImagenetMiniFile(os.path.join(self._data_dir, self.FILE_NAME_VAL))
+        dataset_trn = ImageNetMiniFile(os.path.join(self._data_dir, self.FILE_NAME_TRN))
+        dataset_tst = ImageNetMiniFile(os.path.join(self._data_dir, self.FILE_NAME_TST))
+        dataset_val = ImageNetMiniFile(os.path.join(self._data_dir, self.FILE_NAME_VAL))
         # check sizes
         assert dataset_trn.data.shape == (64*600, 84, 84, 3)
         assert dataset_tst.data.shape == (20*600, 84, 84, 3)
@@ -297,7 +372,7 @@ class ConcatImagenetMiniFiles(Dataset):
         return img, label
 
 
-class ImagenetMiniDataModule(BaseImageModule):
+class ImageNetMiniDataModule(BaseImageModule):
 
     @property
     def img_shape(self) -> Tuple[int, int, int]:
@@ -310,21 +385,21 @@ class ImagenetMiniDataModule(BaseImageModule):
         shuffle: bool = True,
         num_workers: int = os.cpu_count(),
         data_root: str = 'data',
-        return_labels=False
+        return_labels=False,
     ):
         super().__init__(batch_size=batch_size, normalise=normalise, shuffle=shuffle, num_workers=num_workers)
         self._data_root = data_root
         self._return_labels = return_labels
 
     def _setup(self, transform) -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
-        dataset = ConcatImagenetMiniFiles(
+        dataset = ConcatImageNetMiniFiles(
             data_root=self._data_root,
             return_labels=self._return_labels,
             transform=transform,
         )
         # shuffle and split the data
         subset_trn, subset_tst, subset_val = random_split(
-            dataset, [42000, 9000, 9000],
+            dataset, [48000, 6000, 6000],  # 80%, 10%, 10%
             generator=torch.Generator().manual_seed(42),
         )
         # return values
@@ -338,7 +413,13 @@ class ImagenetMiniDataModule(BaseImageModule):
 
 _DATA_MODULE_CLASSES = {
     'mnist': ImageMnistDataModule,
-    'imagenet_mini': ImagenetMiniDataModule
+    'mini_imagenet': ImageNetMiniDataModule,
+    'noise_mnist':                 lambda **kwargs: NoiseImageDataModule(obs_shape=(1, 28, 28), length=60000, sampler='normal',   num_labels=10,  **kwargs),  # alias for normal
+    'noise_mnist_normal':          lambda **kwargs: NoiseImageDataModule(obs_shape=(1, 28, 28), length=60000, sampler='normal',   num_labels=10,  **kwargs),
+    'noise_mnist_uniform':         lambda **kwargs: NoiseImageDataModule(obs_shape=(1, 28, 28), length=60000, sampler='uniform',  num_labels=10,  **kwargs),
+    'noise_mini_imagenet':         lambda **kwargs: NoiseImageDataModule(obs_shape=(3, 84, 84), length=60000, sampler='normal',   num_labels=100, **kwargs),  # alias for normal
+    'noise_mini_imagenet_normal':  lambda **kwargs: NoiseImageDataModule(obs_shape=(3, 84, 84), length=60000, sampler='normal',   num_labels=100, **kwargs),
+    'noise_mini_imagenet_uniform': lambda **kwargs: NoiseImageDataModule(obs_shape=(3, 84, 84), length=60000, sampler='uniform',  num_labels=100, **kwargs),
 }
 
 
@@ -350,7 +431,12 @@ def make_image_data_module(
     return_labels: bool = False,
 ) -> BaseImageModule:
     dataset_cls = _DATA_MODULE_CLASSES[dataset]
-    return dataset_cls(batch_size=batch_size, normalise=normalise, num_workers=num_workers, return_labels=return_labels)
+    return dataset_cls(
+        batch_size=batch_size,
+        normalise=normalise,
+        num_workers=num_workers,
+        return_labels=return_labels,
+    )
 
 
 # ========================================================================= #

@@ -1,3 +1,4 @@
+import warnings
 from typing import Any
 from typing import Optional
 from typing import Sequence
@@ -36,7 +37,7 @@ def get_ae_layer_sizes(start, mid, r=1) -> np.ndarray:
 # ========================================================================= #
 
 
-def _make_targets_for(storage: dict, means: torch.Tensor, stds: torch.Tensor, targets_mean: Union[float, int, torch.Tensor], targets_std: Union[float, int, torch.Tensor]):
+def _make_targets_for(storage: dict, means: torch.Tensor, stds: torch.Tensor, targets_mean: Union[float, int, torch.Tensor], targets_std: Union[float, int, torch.Tensor], device=None):
     # exit early
     if 'targ_means' in storage:
         return storage['targ_means'], storage['targ_stds']
@@ -48,10 +49,23 @@ def _make_targets_for(storage: dict, means: torch.Tensor, stds: torch.Tensor, ta
     # check arrays
     assert targets_mean.shape == means.shape
     assert targets_std.shape == stds.shape
+    # move device
+    targets_mean = targets_mean.to(device=device)
+    targets_std = targets_std.to(device=device)
     # save targets
     storage['targ_means'], storage['targ_stds'] = targets_mean, targets_std
     # get targets
     return targets_mean, targets_std
+
+
+def _get_device():
+    # get device
+    if torch.cuda.is_available():
+        device = 'cuda'
+    else:
+        device = 'cpu'
+        warnings.warn('cuda is not available')
+    return device
 
 
 def norm_activations_optimize(
@@ -68,6 +82,10 @@ def norm_activations_optimize(
 ):
     assert steps > 0 and batch_size > 0 and lr > 0
     sampler = get_sampler(sampler)
+
+    # prepare on device
+    device = _get_device()
+    model = model.to(device=device)
 
     # hook into the outputs of the layers
     # enabling gradients for the norms
@@ -87,7 +105,7 @@ def norm_activations_optimize(
         loss_hist = []
         with tqdm(range(steps), desc='normalising model') as p:
             for i in p:
-                x = sampler(batch_size, *obs_shape)
+                x = sampler(batch_size, *obs_shape, device=device)
                 # feed forward
                 y = model(x)
                 # get outputs statistics
@@ -96,7 +114,7 @@ def norm_activations_optimize(
                 # clear stack
                 outputs.clear()
                 # get targets
-                targ_means, targ_stds = _make_targets_for(storage, means, stds, targets_mean, targets_std)
+                targ_means, targ_stds = _make_targets_for(storage, means, stds, targets_mean, targets_std, device=device)
                 # compute loss
                 loss_mean = F.mse_loss(means, targ_means)
                 loss_std  = F.mse_loss(stds, targ_stds)
@@ -122,12 +140,15 @@ def norm_activations_optimize(
 def norm_activations_analyse(model, obs_shape, sampler='normal', steps=100, batch_size=512) -> Tuple[np.ndarray, np.ndarray]:
     assert steps > 0 and batch_size > 0
     sampler = get_sampler(sampler)
+    # prepare on device
+    device = _get_device()
+    model = model.to(device=device)
     # feed forward
     with torch.no_grad():
         with norm_layers_context(model) as layers, forward_capture_context(layers) as outputs:
             stats = []
             for i in range(steps):
-                x = sampler(batch_size, *obs_shape)
+                x = sampler(batch_size, *obs_shape, device=device)
                 # feed forward
                 y = model(x)
                 # save results

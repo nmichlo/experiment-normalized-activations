@@ -8,6 +8,7 @@ from typing import Sequence
 from typing import Tuple
 from typing import Union
 
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -22,9 +23,10 @@ from exp.nn.swish import Swish
 
 
 _SAMPLERS = {
+    # torch samplers
     'normal':   lambda *shape, dtype=torch.float32, device=None: torch.randn(*shape, dtype=dtype, device=device),
     'uniform':  lambda *shape, dtype=torch.float32, device=None: torch.rand(*shape,  dtype=dtype, device=device),
-    'suniform': lambda *shape, dtype=torch.float32, device=None: torch.rand(*shape,  dtype=dtype, device=device) * 2 - 1
+    'suniform': lambda *shape, dtype=torch.float32, device=None: torch.rand(*shape,  dtype=dtype, device=device) * 2 - 1,
 }
 
 

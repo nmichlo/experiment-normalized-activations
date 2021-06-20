@@ -78,9 +78,9 @@ class SimpleSystem(pl.LightningModule):
         # normalising
         norm_samples: Optional[int] = None,
         norm_sampler: str = 'normal',
-        norm_steps: int = 200,
-        norm_batch_size: int = 32,
-        norm_lr=5e-3,
+        norm_steps: int = 2500,
+        norm_batch_size: int = 256,
+        norm_lr=1e-2,
         norm_targets_mean: Union[float, torch.Tensor] = 0.0,
         norm_targets_std: Union[float, torch.Tensor] = 1.0,
         # extra hparams
@@ -147,9 +147,9 @@ class SimpleSystem(pl.LightningModule):
         # normalising
         norm_samples: Optional[int] = None,
         norm_sampler: str = 'normal',
-        norm_steps: int = 5000,
-        norm_batch_size: int = 128,
-        norm_lr=3e-3,
+        norm_steps: int = 2500,
+        norm_batch_size: int = 256,
+        norm_lr=1e-2,
         norm_targets_mean: Union[float, torch.Tensor] = 0.0,
         norm_targets_std: Union[SlopeArgs, float, torch.Tensor] = 1.0,
         # wandb settings
@@ -218,7 +218,7 @@ class SimpleSystem(pl.LightningModule):
         with torch.no_grad():
             if torch.cuda.is_available():
                 model = model.cuda()
-            img_batch = data.sample_batch(9).cpu()
+            img_batch = data.sample_display_batch(9).cpu()
             out_batch = model(img_batch.to(model.device)).cpu()
             plot_batch(img_batch, out_batch, mean_std=data.norm_mean_std, clip=True)
 
@@ -247,6 +247,7 @@ if __name__ == '__main__':
         log_wandb=True,
         wandb_name='TEMP_',
         wandb_tags=[],
+        dataset='mnist',
     )
 
     # ===================================================================== #
