@@ -3,7 +3,6 @@ import inspect
 import itertools
 import os
 import pickle
-import warnings
 from argparse import Namespace
 from typing import Iterator
 from typing import Optional
@@ -24,6 +23,7 @@ from torch.utils.data import Dataset
 from torch.utils.data import IterableDataset
 from torch.utils.data import random_split
 from torchvision.datasets import MNIST
+
 from exp.nn.activation import get_sampler
 
 
@@ -233,12 +233,13 @@ class NoiseImageDataModule(ImageDataModule):
         num_labels: int = 2,
         length: Optional[int] = 60000,
     ):
+        C, H, W = obs_shape
+        self._img_shape = (H, W, C)
+        # initialise
         super().__init__(batch_size=batch_size, normalise=normalise, shuffle=shuffle, num_workers=num_workers)
         self.save_hyperparameters()
         # initialise
         self._dataset = NoiseDataset(obs_shape=obs_shape, sampler=sampler, return_labels=return_labels, num_labels=num_labels, length=length)
-        C, H, W = obs_shape
-        self._img_shape = (H, W, C)
 
     def _setup(self, transform) -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
         return (self._dataset, self._dataset, self._dataset)
