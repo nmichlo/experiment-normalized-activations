@@ -1,4 +1,5 @@
 import sys
+from typing import Tuple
 
 import pytorch_lightning as pl
 import torch
@@ -9,7 +10,7 @@ from tqdm import tqdm
 
 
 def pl_quick_train(
-    model: pl.LightningModule,
+    system: pl.LightningModule,
     data: pl.LightningDataModule,
     hparams: dict = None,
     # train settings
@@ -25,11 +26,11 @@ def pl_quick_train(
     wandb_project: str = 'default',
     # existing logger
     logger=None,
-):
+) -> Tuple[pl.LightningModule, pl.LightningDataModule, pl.Trainer]:
     extra_hparams = AttributeDict(train_epochs=train_epochs, train_steps=train_steps)
-    if hasattr(data, 'hparams'):  extra_hparams.update(data.hparams)
-    if hasattr(model, 'hparams'): extra_hparams.update(model.hparams)
-    if hparams:                   extra_hparams.update(hparams)
+    if hasattr(data, 'hparams'):   extra_hparams.update(data.hparams)
+    if hasattr(system, 'hparams'): extra_hparams.update(system.hparams)
+    if hparams:                    extra_hparams.update(hparams)
     # create the logger
     if logger is None:
         if wandb_enabled:
@@ -57,6 +58,6 @@ def pl_quick_train(
         **(train_kwargs if train_kwargs else {})
     )
     # train the model
-    trainer.fit(model, data)
+    trainer.fit(system, data)
     # return everything
-    return model, data
+    return system, data, trainer

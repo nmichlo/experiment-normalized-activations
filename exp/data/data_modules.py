@@ -3,6 +3,7 @@ import inspect
 import itertools
 import os
 import pickle
+import warnings
 from argparse import Namespace
 from typing import Iterator
 from typing import Optional
@@ -119,7 +120,7 @@ class ImageDataModule(HparamDataModule):
     ):
         super().__init__()
         # save hyper-parameters
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=['has_trn', 'has_tst', 'has_val'])
         # normalise settings
         if isinstance(self.hparams.normalise, bool):
             self.hparams.norm_mean, self.hparams.norm_std = (0.5, 0.5) if self.hparams.normalise else (0., 1.)
@@ -167,21 +168,15 @@ class ImageDataModule(HparamDataModule):
 
     def _make_dataloader(self, name, data):
         if data is None:
-            raise ValueError(f'{name} was not initialised by: {self.__class__.__name__}.setup')
+            return None
         if isinstance(data, IterableDataset):
-            # WARNING: iterable dataset cannot make use of shuffle!
             return DataLoader(dataset=data, batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers)
         else:
             return DataLoader(dataset=data, batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers, shuffle=self.hparams.shuffle)
 
-    def train_dataloader(self):
-        return self._make_dataloader('data_trn', self._data_trn)
-
-    def test_dataloader(self):
-        return self._make_dataloader('data_tst', self._data_tst)
-
-    def val_dataloader(self):
-        return self._make_dataloader('data_val', self._data_val)
+    def train_dataloader(self): return self._make_dataloader('data_trn', self._data_trn)
+    def test_dataloader(self): return self._make_dataloader('data_tst', self._data_tst)
+    def val_dataloader(self): return self._make_dataloader('data_val', self._data_val)
 
     def sample_display_batch(self, n=9) -> torch.Tensor:
         return next(iter(DataLoader(self._data_val, num_workers=0, batch_size=n, shuffle=False)))
@@ -282,7 +277,7 @@ class ImageMnistDataModule(ImageDataModule):
     def _setup(self, transform) -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
         return (
             self._mnist_cls(root='data', transform=transform, train=True, download=True),    # train
-            None,                                                                       # test
+            None,                                                                            # test
             self._mnist_cls(root='data', transform=transform, train=False, download=False),  # val
         )
 
