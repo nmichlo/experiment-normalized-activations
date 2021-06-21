@@ -1,4 +1,5 @@
 from argparse import Namespace
+from functools import partial
 from typing import Sequence
 from typing import Tuple
 from typing import Type
@@ -8,16 +9,15 @@ import pandas as pd
 import plotly.express as px
 import pytorch_lightning as pl
 import torch
-import types
 import wandb
 from flash.core.classification import ClassificationTask
-from nfnets import ScaledStdConv2d
 from torch import nn
 from torch.nn import functional as F
 from torch_optimizer import RAdam
 
 from exp.data import make_image_data_module
 from exp.nn.swish import Swish
+from exp.nn.weights import init_weights
 from exp.util.nn_utils import find_submodules, replace_submodules
 from exp.util.nn_utils import in_out_capture_context
 from exp.util.nn_utils import replace_conv_and_bn
@@ -37,21 +37,32 @@ def compute_gamma(activation_fn, batch_size=1024, samples=256):
     return gamma
 
 
-def inject_mean_shift(model: nn.Module):
+class MeanShift(nn.Module):
+    def __init__(self, wrapped_module: nn.Module):
+        super().__init__()
+        self.mean_shift = nn.Parameter(torch.zeros(1), requires_grad=True)
+        self.wrapped_module = wrapped_module
+        # mark as shifted
+        assert not hasattr(wrapped_module, '_is_mean_shift_wrapped_'), f'module has already been mean shifted: {wrapped_module}'
+        setattr(wrapped_module, '_is_mean_shift_wrapped_', True)
+
+    def forward(self, x):
+        return self.wrapped_module(x) - self.mean_shift
+
+
+def wrap_mean_shift(model: nn.Module, visit_type=(nn.Conv2d, nn.Linear), visit_instance_of=False):
     """
     Normal layers sometimes struggle to normalise the activations
     if the mean is shifted.
 
-    This function injects a mean_shift parameter onto the models
-    TODO: this should probably create a wrapper nn.Module instead and use that.
+    Wrap layers with a learnable parameter that can counteract this.
     """
-    def _modify(m: nn.Module, key, parent):
-        assert not hasattr(m, 'mean_shift')
-        assert not hasattr(m, 'old_forward')
-        m.register_parameter('mean_shift', nn.Parameter(torch.zeros(1), requires_grad=True))
-        m.old_forward = m.forward
-        m.forward = types.MethodType(lambda self, x: self.old_forward(x) - self.mean_shift, m)
-    return replace_submodules(model, (nn.Conv2d, nn.Linear), _modify)
+    return replace_submodules(
+        model,
+        visit_type=visit_type,
+        modify_fn=lambda c, k, p: MeanShift(c),
+        visit_instance_of=visit_instance_of,
+    )
 
 
 # ===================================================================== #
@@ -162,7 +173,7 @@ def normalize_targets(y: torch.Tensor, y_targ: torch.Tensor, model_type='classif
         return F.one_hot(y_targ, num_classes=y.shape[-1]).float()
     elif model_type == 'regression':
         assert y.shape == y_targ.shape
-        return y_targ
+        return y_targ, {}
     else:
         raise KeyError(f'invalid normalize target model type: {repr(model_type)}')
 
@@ -179,7 +190,7 @@ class RegularizeLayerStatsTask(pl.LightningModule):
         target_std: Union[float, torch.Tensor] = 1.,
         # early stopping
         early_stop_value: float = 0.001,
-        early_stop_exp_weight: float = 0.975,
+        early_stop_exp_weight: float = 0.98,
         # optimizer settings
         optimizer: Type[torch.optim.Optimizer] = torch.optim.Adam,
         optimizer_kwargs: dict = None,
@@ -267,85 +278,106 @@ class RegularizeLayerStatsTask(pl.LightningModule):
         )
 
 
+def has_kwarg(fn, name: str):
+    import inspect
+    params = inspect.signature(fn).parameters
+    return name in params
+
+
 # ===================================================================== #
 # Main
 # ===================================================================== #
 
-
-if __name__ == '__main__':
-
-    # config
-    WANDB = False
-
+def make_conv_model_and_reg_layers(ActType=nn.ReLU, Conv2dType=nn.Conv2d, init_mode: str = None, mean_shift_activations: bool = None, include_last: bool = False):
+    # activations occur inplace
+    if has_kwarg(ActType, 'inplace'):
+        Activation = partial(ActType, inplace=True)
+    # relu needs mean_shift
+    if (mean_shift_activations is None) and (ActType == nn.ReLU):
+        mean_shift_activations = True
     # create the model
     model = nn.Sequential(
-        nn.Conv2d(1, 16, kernel_size=3, padding=1),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(16, 16, kernel_size=3, padding=1),
-        nn.ReLU(inplace=True),
-
-        nn.AvgPool2d(kernel_size=2),
-
-        nn.Conv2d(16, 16, kernel_size=3, padding=1),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(16, 8, kernel_size=3, padding=1),
-        nn.ReLU(inplace=True),
-
-        nn.AvgPool2d(kernel_size=2),
-
-        nn.Flatten(),
-
-        nn.Linear(7*7*8, 128),
-        # nn.Dropout(p=0.5),
-        nn.ReLU(inplace=True),
+        Conv2dType(1, 16, kernel_size=3, padding=1),  Activation(),
+        Conv2dType(16, 16, kernel_size=3, padding=1), Activation(),
+            nn.AvgPool2d(kernel_size=2),
+        Conv2dType(16, 16, kernel_size=3, padding=1), Activation(),
+        Conv2dType(16, 8, kernel_size=3, padding=1),  Activation(),
+            nn.AvgPool2d(kernel_size=2),
+            nn.Flatten(),
+        nn.Linear(7*7*8, 128), nn.Dropout(p=0.5), Activation(),
         nn.Linear(128, 10),
     )
+    # mean shift
+    if mean_shift_activations:
+        print('[mean shift]:', wrap_mean_shift(model))
+    # initialise model weights
+    if init_mode:
+        init_weights(model, mode=init_mode)
+    # get layers
+    layers = find_submodules(model, (Conv2dType, nn.Linear))
+    if not include_last:
+        layers = layers[:-1]
+    # return values
+    return model, layers
 
-    gamma = compute_gamma(Swish())
-    # print(replace_conv_and_bn(model, lambda *args, **kwargs: ScaledStdConv2d(*args, **kwargs, gamma=gamma)))
-    print(replace_conv_and_bn(model, ScaledStdConv2d))
-    print(replace_submodules(model, nn.ReLU, Swish))
-    # init_weights(model, mode=init_mode)
 
-    CONV_TYPE = ScaledStdConv2d
-    ACT_TYPE = Swish
+def __main__(
+    ActType=nn.ReLU,
+    Conv2dType=nn.Conv2d,
+    init_mode: str = None,
+    WANDB = False,
+):
+    hparams = locals()
 
-    ClassificationTask
-
-    # print(inject_mean_shift(model))
-
-    # create the task
-    # classifier = ClassificationTask(
-    #     model,
-    #     loss_fn=F.cross_entropy,
-    #     optimizer=torch.optim.Adam,
-    #     learning_rate=1e-3,
-    # )
-
-    layers = find_submodules(model, (CONV_TYPE, nn.Linear))[:-1]
-
-    # make the data
-    data = make_image_data_module(
-        dataset='noise_mnist',
-        batch_size=128,
-        normalise=True,
-        return_labels=True,
+    model, layers = make_conv_model_and_reg_layers(
+        ActType=ActType,
+        Conv2dType=Conv2dType,
+        init_mode=init_mode,
     )
 
-    system = RegularizeLayerStatsTask(
-        model=model,
-        model_type='classification',
-        layers=layers,
-        optimizer=RAdam,
-        log_wandb_period=500 if WANDB else None,
-        learning_rate=1e-2,
+    # regularize the network
+    _, _, trainer = pl_quick_train(
+        system=RegularizeLayerStatsTask(
+            model=model,
+            model_type='classification',
+            layers=layers,
+            optimizer=RAdam,
+            log_wandb_period=500 if WANDB else None,
+            learning_rate=1e-2,
+        ),
+        data=make_image_data_module(
+            dataset='noise_mnist',
+            batch_size=128,
+            normalise=True,
+            return_labels=True,
+        ),
+        train_epochs=100,
+        wandb_enabled=WANDB,
+        wandb_project='weights-test-2',
+        hparams=hparams,
     )
 
     # train the network
-    pl_quick_train(
-        system, data,
-        train_epochs=10,
+    _, _, _ = pl_quick_train(
+        system=ClassificationTask(
+            model,
+            loss_fn=F.cross_entropy,
+            optimizer=RAdam,
+            learning_rate=1e-3,
+        ),
+        data=make_image_data_module(
+            dataset='mnist',
+            batch_size=128,
+            normalise=True,
+            return_labels=True,
+        ),
+        train_epochs=1,
         wandb_enabled=WANDB,
         wandb_project='weights-test-2',
-        train_kwargs=dict(val_check_interval=1),
+        logger=trainer.logger,
     )
+
+
+if __name__ == '__main__':
+    ASDF=1
+    __main__(WANDB=True)
