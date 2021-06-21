@@ -288,25 +288,49 @@ def has_kwarg(fn, name: str):
 # Main
 # ===================================================================== #
 
-def make_conv_model_and_reg_layers(ActType=nn.ReLU, Conv2dType=nn.Conv2d, init_mode: str = None, mean_shift_activations: bool = None, include_last: bool = False):
+
+def make_model(name: str, Conv2dType=nn.Conv2d, ActType=nn.ReLU):
     # activations occur inplace
     if has_kwarg(ActType, 'inplace'):
-        Activation = partial(ActType, inplace=True)
+        ActType = partial(ActType, inplace=True)
+    # create the model
+    if name == 'mnist_simple_conv':
+        return nn.Sequential(
+            Conv2dType(1,  32, kernel_size=3, padding=1), ActType(),
+            Conv2dType(32, 16, kernel_size=3, padding=1), ActType(),
+                nn.AvgPool2d(kernel_size=2),  # 28x28 -> 14x14
+            Conv2dType(16, 32, kernel_size=3, padding=1), ActType(),
+            Conv2dType(32,  8, kernel_size=3, padding=1), ActType(),
+                nn.AvgPool2d(kernel_size=2),  # 14x14 -> 7x7
+                nn.Flatten(),
+            nn.Linear(7*7*8, 128), nn.Dropout(p=0.5), ActType(),
+            nn.Linear(128, 10),
+        )
+    elif name == 'mini_imagenet_simple_conv':
+        return nn.Sequential(
+            Conv2dType(3,  16, kernel_size=3, padding=1), ActType(),
+            Conv2dType(16, 32, kernel_size=3, padding=1), ActType(),
+                nn.AvgPool2d(kernel_size=3),  # 84x84 -> 28x28
+            Conv2dType(32, 64, kernel_size=3, padding=1), ActType(),
+            Conv2dType(64, 32, kernel_size=3, padding=1), ActType(),
+                nn.AvgPool2d(kernel_size=2),  # 28x28 -> 14x14
+            Conv2dType(32, 64, kernel_size=3, padding=1), ActType(),
+            Conv2dType(64, 16, kernel_size=3, padding=1), ActType(),
+                nn.AvgPool2d(kernel_size=2),  # 14x14 -> 7x7
+                nn.Flatten(),
+            nn.Linear(7*7*16, 384), nn.Dropout(p=0.5), ActType(),
+            nn.Linear(384, 100),
+        )
+    else:
+        raise KeyError(f'invalid model name: {repr(name)}')
+
+
+def make_conv_model_and_reg_layers(name: str, Conv2dType=nn.Conv2d, ActType=nn.ReLU, init_mode: str = None, mean_shift_activations: bool = None, include_last: bool = False):
+    # make model
+    model = make_model(name, ActType=ActType, Conv2dType=Conv2dType)
     # relu needs mean_shift
     if (mean_shift_activations is None) and (ActType == nn.ReLU):
         mean_shift_activations = True
-    # create the model
-    model = nn.Sequential(
-        Conv2dType(1, 16, kernel_size=3, padding=1),  Activation(),
-        Conv2dType(16, 16, kernel_size=3, padding=1), Activation(),
-            nn.AvgPool2d(kernel_size=2),
-        Conv2dType(16, 16, kernel_size=3, padding=1), Activation(),
-        Conv2dType(16, 8, kernel_size=3, padding=1),  Activation(),
-            nn.AvgPool2d(kernel_size=2),
-            nn.Flatten(),
-        nn.Linear(7*7*8, 128), nn.Dropout(p=0.5), Activation(),
-        nn.Linear(128, 10),
-    )
     # mean shift
     if mean_shift_activations:
         print('[mean shift]:', wrap_mean_shift(model))
@@ -326,10 +350,14 @@ def __main__(
     Conv2dType=nn.Conv2d,
     init_mode: str = None,
     WANDB = False,
+    train_epochs=30,
+    model: str = 'simple_conv',
+    dataset: str = 'mini_imagenet'
 ):
     hparams = locals()
 
     model, layers = make_conv_model_and_reg_layers(
+        name=f'{dataset}_{model}',
         ActType=ActType,
         Conv2dType=Conv2dType,
         init_mode=init_mode,
@@ -343,10 +371,10 @@ def __main__(
             layers=layers,
             optimizer=RAdam,
             log_wandb_period=500 if WANDB else None,
-            learning_rate=1e-2,
+            learning_rate=3e-3,
         ),
         data=make_image_data_module(
-            dataset='noise_mnist',
+            dataset=f'noise_{dataset}',
             batch_size=128,
             normalise=True,
             return_labels=True,
@@ -366,18 +394,19 @@ def __main__(
             learning_rate=1e-3,
         ),
         data=make_image_data_module(
-            dataset='mnist',
+            dataset=f'{dataset}',
             batch_size=128,
             normalise=True,
             return_labels=True,
         ),
-        train_epochs=1,
+        train_epochs=train_epochs,
         wandb_enabled=WANDB,
         wandb_project='weights-test-2',
         logger=trainer.logger,
     )
 
+    return model
+
 
 if __name__ == '__main__':
-    ASDF=1
-    __main__(WANDB=True)
+    __main__(WANDB=False)

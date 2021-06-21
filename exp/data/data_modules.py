@@ -336,7 +336,7 @@ class ImageNetMiniFile(Dataset):
         if self._transform_label is not None:
             label = self._transform(label)
         # return both
-        return img, label
+        return img, label.astype('int')
 
 
 class ConcatImageNetMiniFiles(Dataset):
@@ -405,7 +405,7 @@ class ConcatImageNetMiniFiles(Dataset):
         if self._transform_label is not None:
             label = self._transform(label)
         # return both
-        return img, label
+        return img, label.astype('int')
 
 
 class ImageNetMiniDataModule(ImageDataModule):
