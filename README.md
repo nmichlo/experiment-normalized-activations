@@ -1,5 +1,9 @@
 # Normalized Activations
 
+**NOTE**: it turns out similar ideas have already recently been investigated:
+- arxiv: [2101.08692](https://arxiv.org/abs/2101.08692)
+- arxiv: [2102.06171](https://arxiv.org/abs/2102.06171)
+
 Experiments based on normalising neural network activations (or weights)
 in a pretraining step, using random input noise.
 

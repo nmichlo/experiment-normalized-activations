@@ -1,11 +1,10 @@
 import sys
-from pprint import pprint
 
+import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import ProgressBar
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.utilities import AttributeDict
-import pytorch_lightning as pl
 from tqdm import tqdm
 
 
