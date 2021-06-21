@@ -1,7 +1,10 @@
+import copy
+import inspect
 import itertools
 import os
 import pickle
 import warnings
+from argparse import Namespace
 from typing import Iterator
 from typing import Optional
 from typing import Sequence
@@ -12,18 +15,21 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 import torchvision
+from pytorch_lightning.core.saving import ALLOWED_CONFIG_TYPES
+from pytorch_lightning.core.saving import PRIMITIVE_TYPES
+from pytorch_lightning.utilities import AttributeDict
+from pytorch_lightning.utilities.parsing import save_hyperparameters
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from torch.utils.data import IterableDataset
 from torch.utils.data import random_split
-from torch.utils.data.dataset import T_co
 from torchvision.datasets import MNIST
+from exp.nn.activation import get_sampler
 
 
 # ========================================================================= #
 # Helper                                                                    #
 # ========================================================================= #
-from exp.nn.activation import get_sampler
 
 
 def split_sizes(length, n):
@@ -53,7 +59,56 @@ def split_ratios(length, ratios=(0.7, 0.15, 0.15)):
 # ========================================================================= #
 
 
-class BaseImageModule(pl.LightningDataModule):
+class HparamDataModule(pl.LightningDataModule):
+
+    def __init__(self):
+        super().__init__()
+        self._hparams = AttributeDict()
+        self._hparams_initial = AttributeDict()
+
+    def save_hyperparameters(self, *args, ignore: Optional[Union[Sequence[str], str]] = None) -> None:
+        """Copied from pl.LightningModule"""
+        frame = inspect.currentframe().f_back
+        save_hyperparameters(self, *args, ignore=ignore, frame=frame)
+
+    @property
+    def hparams(self) -> Union[AttributeDict, dict, Namespace]:
+        """Copied from pl.LightningModule"""
+        if not hasattr(self, "_hparams"):
+            self._hparams = AttributeDict()
+        return self._hparams
+
+    @property
+    def hparams_initial(self) -> AttributeDict:
+        """Copied from pl.LightningModule"""
+        if not hasattr(self, "_hparams_initial"):
+            return AttributeDict()
+        # prevent any change
+        return copy.deepcopy(self._hparams_initial)
+
+    def _set_hparams(self, hp: Union[dict, Namespace, str]) -> None:
+        """Copied from pl.LightningModule"""
+        if isinstance(hp, Namespace):
+            hp = vars(hp)
+        if isinstance(hp, dict):
+            hp = AttributeDict(hp)
+        elif isinstance(hp, PRIMITIVE_TYPES):
+            raise ValueError(f"Primitives {PRIMITIVE_TYPES} are not allowed.")
+        elif not isinstance(hp, ALLOWED_CONFIG_TYPES):
+            raise ValueError(f"Unsupported config type of {type(hp)}.")
+
+        if isinstance(hp, dict) and isinstance(self.hparams, dict):
+            self.hparams.update(hp)
+        else:
+            self._hparams = hp
+
+
+# ========================================================================= #
+# Base Data Module                                                          #
+# ========================================================================= #
+
+
+class ImageDataModule(HparamDataModule):
 
     def __init__(
         self,
@@ -63,10 +118,18 @@ class BaseImageModule(pl.LightningDataModule):
         num_workers: int = os.cpu_count(),
     ):
         super().__init__()
-        self._batch_size = batch_size
-        self._shuffle = shuffle
-        self._normalise = normalise
-        self._num_workers = num_workers
+        # save hyper-parameters
+        self.save_hyperparameters()
+        # normalise settings
+        if isinstance(self.hparams.normalise, bool):
+            self.hparams.norm_mean, self.hparams.norm_std = (0.5, 0.5) if self.hparams.normalise else (0., 1.)
+        else:
+            self.hparams.norm_mean, self.hparams.norm_std = self.hparams.normalise
+            self.hparams.normalise = True
+        # extra hparams
+        self.hparams.img_shape = self.img_shape
+        self.hparams.obs_shape = self.obs_shape
+        self.hparams.dataset = self.__class__.__name__
         # datasets
         self._data_trn: Dataset = None
         self._data_tst: Dataset = None
@@ -76,31 +139,18 @@ class BaseImageModule(pl.LightningDataModule):
 
     def setup(self, stage=None):
         if self._has_setup:
-            warnings.warn(f'dataset {self.__class__.__name__} has been setup more than once... skipping step!')
             return
         self._has_setup = True
         # get image normalise transform
-        if self._normalise is False:
-            transform = torchvision.transforms.ToTensor()
-        else:
-            transform = torchvision.transforms.Compose([
-                torchvision.transforms.ToTensor(),
-                torchvision.transforms.Normalize(*self.norm_mean_std)
-            ])
+        transform = torchvision.transforms.Compose([
+            torchvision.transforms.ToTensor(),
+            torchvision.transforms.Normalize(self.hparams.norm_mean, self.hparams.norm_std)
+        ])
         # load data
         self._data_trn, self._data_tst, self._data_val = self._setup(transform=transform)
 
     def _setup(self, transform) -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
         raise NotImplementedError
-
-    @property
-    def norm_mean_std(self) -> Tuple[float, float]:
-        if isinstance(self._normalise, bool):
-            mean, std = (0.5, 0.5) if self._normalise else (0., 1.)
-        else:
-            mean, std = self._normalise
-        # return values
-        return float(mean), float(std)
 
     @property
     def img_shape(self) -> Tuple[int, int, int]:
@@ -120,9 +170,9 @@ class BaseImageModule(pl.LightningDataModule):
             raise ValueError(f'{name} was not initialised by: {self.__class__.__name__}.setup')
         if isinstance(data, IterableDataset):
             # WARNING: iterable dataset cannot make use of shuffle!
-            return DataLoader(dataset=data, batch_size=self._batch_size)
+            return DataLoader(dataset=data, batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers)
         else:
-            return DataLoader(dataset=data, batch_size=self._batch_size, shuffle=self._shuffle)
+            return DataLoader(dataset=data, batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers, shuffle=self.hparams.shuffle)
 
     def train_dataloader(self):
         return self._make_dataloader('data_trn', self._data_trn)
@@ -169,7 +219,7 @@ class NoiseDataset(IterableDataset):
                 yield obs
 
 
-class NoiseImageDataModule(BaseImageModule):
+class NoiseImageDataModule(ImageDataModule):
 
     def __init__(
         self,
@@ -184,6 +234,8 @@ class NoiseImageDataModule(BaseImageModule):
         length: Optional[int] = 60000,
     ):
         super().__init__(batch_size=batch_size, normalise=normalise, shuffle=shuffle, num_workers=num_workers)
+        self.save_hyperparameters()
+        # initialise
         self._dataset = NoiseDataset(obs_shape=obs_shape, sampler=sampler, return_labels=return_labels, num_labels=num_labels, length=length)
         C, H, W = obs_shape
         self._img_shape = (H, W, C)
@@ -207,7 +259,7 @@ class ImageMNIST(MNIST, Sequence):
         return img
 
 
-class ImageMnistDataModule(BaseImageModule):
+class ImageMnistDataModule(ImageDataModule):
 
     def __init__(
         self,
@@ -218,6 +270,8 @@ class ImageMnistDataModule(BaseImageModule):
         return_labels=False
     ):
         super().__init__(batch_size=batch_size, normalise=normalise, shuffle=shuffle, num_workers=num_workers)
+        self.save_hyperparameters()
+        # initialise
         self._mnist_cls = MNIST if return_labels else ImageMNIST
 
     @property
@@ -229,20 +283,6 @@ class ImageMnistDataModule(BaseImageModule):
             self._mnist_cls(root='data', transform=transform, train=True, download=True),    # train
             None,                                                                       # test
             self._mnist_cls(root='data', transform=transform, train=False, download=False),  # val
-        )
-
-
-class MnistDataModule(BaseImageModule):
-
-    @property
-    def img_shape(self) -> Tuple[int, int, int]:
-        return (28, 28, 1)
-
-    def _setup(self, transform) -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
-        return (
-            MNIST(root='data', transform=transform, train=True, download=True),    # train
-            None,                                                                  # test
-            MNIST(root='data', transform=transform, train=False, download=False),  # val
         )
 
 
@@ -372,7 +412,7 @@ class ConcatImageNetMiniFiles(Dataset):
         return img, label
 
 
-class ImageNetMiniDataModule(BaseImageModule):
+class ImageNetMiniDataModule(ImageDataModule):
 
     @property
     def img_shape(self) -> Tuple[int, int, int]:
@@ -388,6 +428,8 @@ class ImageNetMiniDataModule(BaseImageModule):
         return_labels=False,
     ):
         super().__init__(batch_size=batch_size, normalise=normalise, shuffle=shuffle, num_workers=num_workers)
+        self.save_hyperparameters()
+        # initialise
         self._data_root = data_root
         self._return_labels = return_labels
 
@@ -429,13 +471,15 @@ def make_image_data_module(
     normalise: Union[bool, Tuple[float, float]] = False,
     num_workers: int = os.cpu_count(),
     return_labels: bool = False,
-) -> BaseImageModule:
+    **kwargs,
+) -> ImageDataModule:
     dataset_cls = _DATA_MODULE_CLASSES[dataset]
     return dataset_cls(
         batch_size=batch_size,
         normalise=normalise,
         num_workers=num_workers,
         return_labels=return_labels,
+        **kwargs,
     )
 
 

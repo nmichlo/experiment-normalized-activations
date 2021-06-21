@@ -1,0 +1,7 @@
+torch
+pytorch-lightning
+nfnets-pytorch
+numpy
+tqdm
+matplotlib
+lightning-flash
