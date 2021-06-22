@@ -146,10 +146,13 @@ class GenericActivation(nn.Module):
 
 
 def Activation(activation: str = 'norm_tanh') -> nn.Module:
-    if activation in ACTIVATION_CLASSES:
-        return ACTIVATION_CLASSES[activation]()
-    else:
-        return GenericActivation(ACTIVATIONS[activation])
+    try:
+        if activation in ACTIVATION_CLASSES:
+            return ACTIVATION_CLASSES[activation]()
+        else:
+            return GenericActivation(ACTIVATIONS[activation])
+    except KeyError:
+        raise KeyError(f'invalid activation: {repr(activation)}, allowed: {sorted(ACTIVATION_CLASSES.keys() | ACTIVATIONS.keys())}')
 
 
 def ActivationMaker(activation: str = 'norm_tanh'):

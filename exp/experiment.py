@@ -11,33 +11,28 @@ import pandas as pd
 import plotly.express as px
 import pytorch_lightning as pl
 import torch
-import torch_optimizer
 import wandb
 from flash.core.classification import ClassificationTask
+from nfnets import ScaledStdConv2d
 from torch import nn
 from torch.nn import functional as F
 from torch.optim import Adam
-from torch.optim import Adamax
-from torch_optimizer import RAdam
-
-from nfnets import ScaledStdConv2d, WSConv2d
 
 from exp.data import make_image_data_module
 from exp.nn.activation import Activation
 from exp.nn.activation import ActivationMaker
-from exp.nn.model import get_ae_layer_sizes
 from exp.nn.model import get_layer_sizes
-from exp.nn.swish import Swish
 from exp.nn.weights import init_weights
-from exp.util.nn_utils import find_submodules, replace_submodules
+from exp.util.nn_utils import find_submodules
 from exp.util.nn_utils import in_out_capture_context
+from exp.util.nn_utils import replace_submodules
 from exp.util.pl_utils import pl_quick_train
+from exp.util.utils import iter_pairs
 
 
 # ===================================================================== #
 # Layer Handling
 # ===================================================================== #
-from exp.util.utils import iter_pairs
 
 
 @torch.no_grad()
@@ -81,22 +76,22 @@ def wrap_mean_shift(model: nn.Module, visit_type=(nn.Conv2d, nn.Linear), visit_i
 # ===================================================================== #
 
 
-# class WandbLayerCallback(pl.Callback):
-#     def __init__(self, layers: Sequence[nn.Module], log_period: int = 500):
-#         self._layers = layers
-#         self._layer_handler = None
-#         self._log_period = log_period
-#     # logger
-#     def batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, outputs, batch, batch_idx, dataloader_idx, log=False):
-#         inp_stds, out_stds, inp_means, out_means = self._layer_handler.step()
-#         if log and (trainer.global_step % self._log_period == 0):
-#             self._layer_handler.wandb_log_plots(inp_stds, out_stds, inp_means, out_means)
-#     # hooks
-#     def on_fit_start(self, trainer, pl_module): self._layer_handler = LayerStatsHandler(self._layers).start()
-#     def on_fit_end(self,   trainer, pl_module): self._layer_handler.end()
-#     def on_train_batch_end(self, *args, **kwargs):      self.batch_end(*args, **kwargs, log=False)
-#     def on_test_batch_end(self, *args, **kwargs):       self.batch_end(*args, **kwargs, log=False)
-#     def on_validation_batch_end(self, *args, **kwargs): self.batch_end(*args, **kwargs, log=False)
+class WandbLayerCallback(pl.Callback):
+    def __init__(self, layers: Sequence[nn.Module], log_period: int = 500):
+        self._layers = layers
+        self._layer_handler = None
+        self._log_period = log_period
+    # logger
+    def batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, outputs, batch, batch_idx, dataloader_idx, log=False):
+        inp_stds, out_stds, inp_means, out_means = self._layer_handler.step()
+        if log and (trainer.global_step % self._log_period == 0):
+            self._layer_handler.wandb_log_plots(inp_stds, out_stds, inp_means, out_means)
+    # hooks
+    def on_fit_start(self, trainer, pl_module): self._layer_handler = LayerStatsHandler(self._layers).start()
+    def on_fit_end(self,   trainer, pl_module): self._layer_handler.end()
+    def on_train_batch_end(self, *args, **kwargs):      self.batch_end(*args, **kwargs, log=True)
+    def on_test_batch_end(self, *args, **kwargs):       self.batch_end(*args, **kwargs, log=False)
+    def on_validation_batch_end(self, *args, **kwargs): self.batch_end(*args, **kwargs, log=False)
 
 
 class LayerStatsHandler(object):
@@ -485,18 +480,33 @@ def make_conv_model_and_reg_layers(name: str, Conv2dType=nn.Conv2d, ActType=nn.R
     return model, layers
 
 
+def get_conv_type(conv_type: str, activation: str):
+    # compute gamma for ScaledStdConv2d
+    gamma = compute_gamma(Activation(activation))
+    print('\033[93m', 'GAMMA: ', gamma, '\033[0m', sep='')
+    # get the conv maker
+    if conv_type == 'scaled_conv':
+        return lambda *args, **kwargs: ScaledStdConv2d(*args, **kwargs, gamma=gamma, use_layernorm=True)
+    elif conv_type == 'conv':
+        return nn.Conv2d
+    else:
+        raise KeyError(f'invalid conv_type: {repr(conv_type)}')
+
+
 # ===================================================================== #
 # Main
 # ===================================================================== #
 
 
 def __main__(
+    task = 'classify',
+    # wandb
     wandb_enabled: bool = False,
     wandb_project: str = 'weights-test',
     # model settings
     model: str = 'simple_fc_deep',
     model_activation: str = 'swish',
-    model_conv_type: str = 'conv',
+    model_conv: str = 'conv',
     model_init_mode: str = 'xavier_normal',
     # dataset
     dataset: str = 'mnist',
@@ -518,17 +528,19 @@ def __main__(
     train_scheduler=None,
     train_scheduler_kwargs=None,
 ):
-    hparams = locals()
+    hparams = locals().copy()
 
-    # strings to types
-    model_activation = ActivationMaker(activation=activation)
-    model_conv_type = get_conv_type(conv_type=conv_type, activation=activation)
+    # TODO: add AE task!
+    assert task == 'classify', 'other tasks are not yet supported'
+
+    # get name
+    wandb_name = f'{model_activation}:{model_conv}:{model_init_mode}:{model}|{getattr(train_optimizer, "__name__", train_optimizer)}:{regularize}|{task}'
 
     # make the model
     model, layers = make_conv_model_and_reg_layers(
         name=f'{dataset}_{model}',
-        ActType=model_activation,
-        Conv2dType=model_conv_type,
+        ActType=ActivationMaker(activation=model_activation),
+        Conv2dType=get_conv_type(conv_type=model_conv, activation=model_activation),
         init_mode=model_init_mode,
         include_last=not reg_model_output,
     )
@@ -548,20 +560,23 @@ def __main__(
             system=RegularizeLayerStatsTask(
                 target_mean=reg_target_mean,
                 target_std=reg_target_std,
+                early_stop_value=0.01,
                 model=model,
                 model_type='classification',
                 layers=layers,
                 optimizer=train_optimizer,
                 optimizer_kwargs=train_optimizer_kwargs if train_optimizer_kwargs else {},
-                log_wandb_period=500 if wandb_enabled else None,
+                log_wandb_period=None,
                 learning_rate=reg_lr,
                 reg_model_output=reg_model_output,
                 log_data_stats=False,
             ),
             data=reg_data,
-            train_epochs=100,
+            train_epochs=3,
+            train_steps=2000,
             wandb_enabled=wandb_enabled,
-            wandb_project='weights-test-2',
+            wandb_project=wandb_project,
+            wandb_name=wandb_name,
             hparams=hparams,
         )
         del reg_data, _
@@ -586,23 +601,12 @@ def __main__(
         train_epochs=train_epochs,
         wandb_enabled=wandb_enabled,
         wandb_project=wandb_project,
+        wandb_name=wandb_name,
         logger=trainer.logger if (trainer is not None) else None,
+        train_callbacks=[WandbLayerCallback(layers, log_period=500)] if wandb_enabled else [],
     )
     del _
     return model
-
-
-def get_conv_type(conv_type: str, activation: str):
-    # compute gamma for ScaledStdConv2d
-    gamma = compute_gamma(Activation(activation))
-    print('\033[93m', 'GAMMA: ', gamma, '\033[0m', sep='')
-    # get the conv maker
-    if conv_type == 'scaled_conv':
-        return lambda *args, **kwargs: ScaledStdConv2d(*args, **kwargs, gamma=gamma, use_layernorm=True)
-    elif conv_type == 'conv':
-        return nn.Conv2d
-    else:
-        raise KeyError(f'invalid conv_type: {repr(conv_type)}')
 
 
 if __name__ == '__main__':
@@ -610,29 +614,25 @@ if __name__ == '__main__':
     # 99.6 % after 3rd epoch
     # 99.7 % after ~15-20 epochs
 
-    activation = 'swish'
-    conv_type = 'scaled_conv'
-    init_mode = 'xavier_normal'
-
     __main__(
-        wandb_enabled=False,
+        wandb_enabled=True,
         # model settings
         dataset='mnist',
-        model='simple_conv_large',
-        model_activation='norm_swish',
-        model_conv_type='scaled_conv',
+        model='simple_fc_deep',
+        model_activation='swish',
+        model_conv='scaled_conv',
         model_init_mode='xavier_normal',
         # regularisation settings
         # NOTE: no reg seems to be better unfortunately -- just use ScaledStdConv2d with xavier_normal init
         regularize=False,
-        reg_lr=1e-3,
-        reg_target_std=1.0,  # SlopeArgs(a=0.999, y_0=0.1, y_n=1.0),
-        reg_with_noise=False,
+        reg_lr=5e-4,
+        reg_target_std=1.0, # SlopeArgs(a=-0.95, y_0=2, y_n=17.0),
+        reg_with_noise=True,
         reg_model_output=True,
         # training settings
         train_lr=1e-3,
         train_epochs=100,
-        train_optimizer=torch_optimizer.AdaBelief,  # Adam, RAdam,
+        train_optimizer=torch.optim.Adam,  # Adam, RAdam,
         # train_optimizer_kwargs=dict(eps=1e-5, weight_decay=1e-5),
         # train_optimizer_kwargs=dict(eps=1e-5, weight_decay=1e-5),
         # scheduler

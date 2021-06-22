@@ -168,16 +168,17 @@ class ImageDataModule(HparamDataModule):
         return int(np.prod(self.img_shape))
 
     def _make_dataloader(self, name, data):
+        assert name in ('trn', 'tst', 'val')
         if data is None:
             return None
         if isinstance(data, IterableDataset):
             return DataLoader(dataset=data, batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers)
         else:
-            return DataLoader(dataset=data, batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers, shuffle=self.hparams.shuffle)
+            return DataLoader(dataset=data, batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers, shuffle=self.hparams.shuffle if (name == 'trn') else False)
 
-    def train_dataloader(self): return self._make_dataloader('data_trn', self._data_trn)
-    def test_dataloader(self): return self._make_dataloader('data_tst', self._data_tst)
-    def val_dataloader(self): return self._make_dataloader('data_val', self._data_val)
+    def train_dataloader(self): return self._make_dataloader('trn', self._data_trn)
+    def test_dataloader(self): return self._make_dataloader('tst', self._data_tst)
+    def val_dataloader(self): return self._make_dataloader('val', self._data_val)
 
     def sample_display_batch(self, n=9) -> torch.Tensor:
         return next(iter(DataLoader(self._data_val, num_workers=0, batch_size=n, shuffle=False)))
