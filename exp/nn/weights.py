@@ -9,6 +9,7 @@ from torch import nn
 
 
 _WEIGHT_INIT_MODES = {
+    'none': lambda x: None,
     'default': lambda x: None,
     'uniform': torch.nn.init.uniform_,
     'normal': torch.nn.init.normal_,
@@ -56,9 +57,10 @@ def _init_layer_weights(layer: nn.Module, mode='xavier_normal', verbose=False):
     if isinstance(layer, (nn.Linear, nn.Conv2d, nn.ConvTranspose2d)):
         init_tensor(layer.weight, mode=mode)
         init_tensor(layer.bias, mode='zeros')
+        print(f'\033[92m{mode} initialised\033[0m: {type(layer).__name__}')
     else:
         if verbose:
-            print(f'warning, no init logic for layer of type: {type(layer)}')
+            print(f'\033[91skipped initialising\033[0m: {type(layer).__name__}')
     return layer
 
 
@@ -73,7 +75,7 @@ def init_weights(model: nn.Module, mode='xavier_normal', verbose=False) -> nn.Mo
 # ========================================================================= #
 
 
-@register_weight_initializer('custom')
+@register_weight_initializer('custom_normal')
 def _custom_weight_init(weight: torch.Tensor):
     assert weight.ndim == 2, f'custom initializer only works with weights with 2 dimensions, got: {weight.shape}'
     out, inp = weight.shape
@@ -81,7 +83,7 @@ def _custom_weight_init(weight: torch.Tensor):
         weight.normal_(0., np.sqrt(1 / inp))
 
 
-@register_weight_initializer('custom_alt')
+@register_weight_initializer('custom_normal_alt')
 def _custom_alt_weight_init(weight: torch.Tensor):
     assert weight.ndim == 2, f'custom_alt initializer only works with weights with 2 dimensions, got: {weight.shape}'
     out, inp = weight.shape

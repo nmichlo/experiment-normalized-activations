@@ -24,6 +24,7 @@ from torch.utils.data import Dataset
 from torch.utils.data import IterableDataset
 from torch.utils.data import random_split
 from torchvision.datasets import MNIST
+
 from exp.nn.activation import get_sampler
 
 
@@ -113,19 +114,16 @@ class ImageDataModule(HparamDataModule):
     def __init__(
         self,
         batch_size: int = 128,
-        normalise: Union[bool, Tuple[float, float]] = False,
+        shift_mean_std: Tuple[float, float] = (0., 1.),
         shuffle: bool = True,
         num_workers: int = os.cpu_count(),
     ):
+        # initialise
         super().__init__()
+        # checks
+        _, _ = shift_mean_std
         # save hyper-parameters
-        self.save_hyperparameters()
-        # normalise settings
-        if isinstance(self.hparams.normalise, bool):
-            self.hparams.norm_mean, self.hparams.norm_std = (0.5, 0.5) if self.hparams.normalise else (0., 1.)
-        else:
-            self.hparams.norm_mean, self.hparams.norm_std = self.hparams.normalise
-            self.hparams.normalise = True
+        self.save_hyperparameters(ignore=['has_trn', 'has_tst', 'has_val'])
         # extra hparams
         self.hparams.img_shape = self.img_shape
         self.hparams.obs_shape = self.obs_shape
@@ -144,13 +142,17 @@ class ImageDataModule(HparamDataModule):
         # get image normalise transform
         transform = torchvision.transforms.Compose([
             torchvision.transforms.ToTensor(),
-            torchvision.transforms.Normalize(self.hparams.norm_mean, self.hparams.norm_std)
+            torchvision.transforms.Normalize(*self.shift_mean_std)
         ])
         # load data
         self._data_trn, self._data_tst, self._data_val = self._setup(transform=transform)
 
     def _setup(self, transform) -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
         raise NotImplementedError
+
+    @property
+    def shift_mean_std(self) -> Tuple[float, float]:
+        return tuple(self.hparams.shift_mean_std)
 
     @property
     def img_shape(self) -> Tuple[int, int, int]:
@@ -166,22 +168,17 @@ class ImageDataModule(HparamDataModule):
         return int(np.prod(self.img_shape))
 
     def _make_dataloader(self, name, data):
+        assert name in ('trn', 'tst', 'val')
         if data is None:
-            raise ValueError(f'{name} was not initialised by: {self.__class__.__name__}.setup')
+            return None
         if isinstance(data, IterableDataset):
-            # WARNING: iterable dataset cannot make use of shuffle!
             return DataLoader(dataset=data, batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers)
         else:
-            return DataLoader(dataset=data, batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers, shuffle=self.hparams.shuffle)
+            return DataLoader(dataset=data, batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers, shuffle=self.hparams.shuffle if (name == 'trn') else False)
 
-    def train_dataloader(self):
-        return self._make_dataloader('data_trn', self._data_trn)
-
-    def test_dataloader(self):
-        return self._make_dataloader('data_tst', self._data_tst)
-
-    def val_dataloader(self):
-        return self._make_dataloader('data_val', self._data_val)
+    def train_dataloader(self): return self._make_dataloader('trn', self._data_trn)
+    def test_dataloader(self): return self._make_dataloader('tst', self._data_tst)
+    def val_dataloader(self): return self._make_dataloader('val', self._data_val)
 
     def sample_display_batch(self, n=9) -> torch.Tensor:
         return next(iter(DataLoader(self._data_val, num_workers=0, batch_size=n, shuffle=False)))
@@ -201,22 +198,38 @@ class NoiseDataset(IterableDataset):
         return_labels: bool = False,
         num_labels: int = 2,
         length: Optional[int] = 60000,
+        transform=None,
+        transform_label=None,
     ):
-        self._sampler = get_sampler(sampler)
-        self._obs_shape = obs_shape
+        C, H, W = obs_shape
+        self._img_shape = (H, W, C)
+        self._sampler = get_sampler(sampler, tensor=False)
         self._return_labels = return_labels
         self._num_labels = num_labels
         self._length = length
+        self._transform = transform
+        self._transform_label = transform_label
+        # warnings
+        if self._transform is not None:
+            warnings.warn(f'`transform` applied to {self.__class__.__name__} is probably incorrect, rather adjust the `sampler`')
 
     def __iter__(self) -> Iterator[torch.Tensor]:
         counter = itertools.count() if (self._length is None) else range(self._length)
         # yield all values!
         for i in counter:
-            obs = self._sampler(*self._obs_shape, dtype=torch.float32, device=None)
-            if self._return_labels:
-                yield obs, np.random.randint(0, self._num_labels)
-            else:
+            # handle obs
+            obs = self._sampler(*self._img_shape)
+            if self._transform is not None:
+                obs = self._transform(obs)
+            # return obs
+            if not self._return_labels:
                 yield obs
+            # handle labels
+            label = np.random.randint(0, self._num_labels)
+            if self._transform_label is not None:
+                label = self._transform_label(label)
+            # return both
+            yield obs, label
 
 
 class NoiseImageDataModule(ImageDataModule):
@@ -226,22 +239,27 @@ class NoiseImageDataModule(ImageDataModule):
         obs_shape: Tuple[int, int, int] = (1, 28, 28),
         sampler: str = 'normal',
         batch_size: int = 128,
-        normalise: Union[bool, Tuple[float, float]] = False,
+        shift_mean_std: Tuple[float, float] = (0., 1.),
         shuffle: bool = True,
         num_workers: int = os.cpu_count(),
         return_labels: bool = False,
         num_labels: int = 2,
-        length: Optional[int] = 60000,
+        # sizes
+        trn_length: Optional[int] = 60000,
+        val_length: Optional[int] = 10000,
+        tst_length: Optional[int] = 10000,
     ):
-        super().__init__(batch_size=batch_size, normalise=normalise, shuffle=shuffle, num_workers=num_workers)
-        self.save_hyperparameters()
-        # initialise
-        self._dataset = NoiseDataset(obs_shape=obs_shape, sampler=sampler, return_labels=return_labels, num_labels=num_labels, length=length)
         C, H, W = obs_shape
         self._img_shape = (H, W, C)
+        # initialise
+        super().__init__(batch_size=batch_size, shift_mean_std=shift_mean_std, shuffle=shuffle, num_workers=num_workers)
+        self.save_hyperparameters()
 
     def _setup(self, transform) -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
-        return (self._dataset, self._dataset, self._dataset)
+        trn_dataset = None if (self.hparams.trn_length is None) else NoiseDataset(obs_shape=self.hparams.obs_shape, sampler=self.hparams.sampler, return_labels=self.hparams.return_labels, num_labels=self.hparams.num_labels, length=self.hparams.trn_length, transform=transform)
+        tst_dataset = None if (self.hparams.val_length is None) else NoiseDataset(obs_shape=self.hparams.obs_shape, sampler=self.hparams.sampler, return_labels=self.hparams.return_labels, num_labels=self.hparams.num_labels, length=self.hparams.val_length, transform=transform)
+        val_dataset = None if (self.hparams.tst_length is None) else NoiseDataset(obs_shape=self.hparams.obs_shape, sampler=self.hparams.sampler, return_labels=self.hparams.return_labels, num_labels=self.hparams.num_labels, length=self.hparams.tst_length, transform=transform)
+        return (trn_dataset, tst_dataset, val_dataset)
 
     @property
     def img_shape(self) -> Tuple[int, int, int]:
@@ -264,12 +282,12 @@ class ImageMnistDataModule(ImageDataModule):
     def __init__(
         self,
         batch_size: int = 128,
-        normalise: Union[bool, Tuple[float, float]] = False,
+        shift_mean_std: Tuple[float, float] = (0., 1.),
         shuffle: bool = True,
         num_workers: int = os.cpu_count(),
         return_labels=False
     ):
-        super().__init__(batch_size=batch_size, normalise=normalise, shuffle=shuffle, num_workers=num_workers)
+        super().__init__(batch_size=batch_size, shift_mean_std=shift_mean_std, shuffle=shuffle, num_workers=num_workers)
         self.save_hyperparameters()
         # initialise
         self._mnist_cls = MNIST if return_labels else ImageMNIST
@@ -281,7 +299,7 @@ class ImageMnistDataModule(ImageDataModule):
     def _setup(self, transform) -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
         return (
             self._mnist_cls(root='data', transform=transform, train=True, download=True),    # train
-            None,                                                                       # test
+            None,                                                                            # test
             self._mnist_cls(root='data', transform=transform, train=False, download=False),  # val
         )
 
@@ -340,7 +358,7 @@ class ImageNetMiniFile(Dataset):
         if self._transform_label is not None:
             label = self._transform(label)
         # return both
-        return img, label
+        return img, label.astype('int')
 
 
 class ConcatImageNetMiniFiles(Dataset):
@@ -409,7 +427,7 @@ class ConcatImageNetMiniFiles(Dataset):
         if self._transform_label is not None:
             label = self._transform(label)
         # return both
-        return img, label
+        return img, label.astype('int')
 
 
 class ImageNetMiniDataModule(ImageDataModule):
@@ -421,13 +439,14 @@ class ImageNetMiniDataModule(ImageDataModule):
     def __init__(
         self,
         batch_size: int = 128,
-        normalise: Union[bool, Tuple[float, float]] = False,
+        shift_mean_std: Tuple[float, float] = (0., 1.),
         shuffle: bool = True,
         num_workers: int = os.cpu_count(),
         data_root: str = 'data',
         return_labels=False,
+        has_test_data=False,
     ):
-        super().__init__(batch_size=batch_size, normalise=normalise, shuffle=shuffle, num_workers=num_workers)
+        super().__init__(batch_size=batch_size, shift_mean_std=shift_mean_std, shuffle=shuffle, num_workers=num_workers)
         self.save_hyperparameters()
         # initialise
         self._data_root = data_root
@@ -440,12 +459,18 @@ class ImageNetMiniDataModule(ImageDataModule):
             transform=transform,
         )
         # shuffle and split the data
-        subset_trn, subset_tst, subset_val = random_split(
-            dataset, [48000, 6000, 6000],  # 80%, 10%, 10%
-            generator=torch.Generator().manual_seed(42),
-        )
-        # return values
-        return subset_trn, subset_tst, subset_val
+        if self.hparams.has_test_data:
+            subset_trn, subset_tst, subset_val = random_split(
+                dataset, [45000, 7500, 7500],  # 75%, 12.5%, 12.5%
+                generator=torch.Generator().manual_seed(42),
+            )
+            return subset_trn, subset_tst, subset_val
+        else:
+            subset_trn, subset_val = random_split(
+                dataset, [51000, 9000],  # (6/7) ~= 85%, (1/7) ~= 15% # mnist ratios
+                generator=torch.Generator().manual_seed(42),
+            )
+            return subset_trn, None, subset_val
 
 
 # ========================================================================= #
@@ -453,30 +478,51 @@ class ImageNetMiniDataModule(ImageDataModule):
 # ========================================================================= #
 
 
+_DATA_MEAN_STD = {
+    'mnist':                       (0.1306604762738431, 0.3081078038564622),  # TODO: verify this!
+    'noise_mnist':                 (0., 1.),
+    'noise_mnist_normal':          (0., 1.),
+    'noise_mnist_uniform':         (0., 1.),
+    'mini_imagenet':               (0.5, 0.5),  # TODO: THIS IS WRONG!
+    'noise_mini_imagenet':         (0., 1.),
+    'noise_mini_imagenet_normal':  (0., 1.),
+    'noise_mini_imagenet_uniform': (0., 1.),
+}
+
 _DATA_MODULE_CLASSES = {
-    'mnist': ImageMnistDataModule,
-    'mini_imagenet': ImageNetMiniDataModule,
-    'noise_mnist':                 lambda **kwargs: NoiseImageDataModule(obs_shape=(1, 28, 28), length=60000, sampler='normal',   num_labels=10,  **kwargs),  # alias for normal
-    'noise_mnist_normal':          lambda **kwargs: NoiseImageDataModule(obs_shape=(1, 28, 28), length=60000, sampler='normal',   num_labels=10,  **kwargs),
-    'noise_mnist_uniform':         lambda **kwargs: NoiseImageDataModule(obs_shape=(1, 28, 28), length=60000, sampler='uniform',  num_labels=10,  **kwargs),
-    'noise_mini_imagenet':         lambda **kwargs: NoiseImageDataModule(obs_shape=(3, 84, 84), length=60000, sampler='normal',   num_labels=100, **kwargs),  # alias for normal
-    'noise_mini_imagenet_normal':  lambda **kwargs: NoiseImageDataModule(obs_shape=(3, 84, 84), length=60000, sampler='normal',   num_labels=100, **kwargs),
-    'noise_mini_imagenet_uniform': lambda **kwargs: NoiseImageDataModule(obs_shape=(3, 84, 84), length=60000, sampler='uniform',  num_labels=100, **kwargs),
+    'mnist':                       ImageMnistDataModule,
+    'noise_mnist':                 lambda **kwargs: NoiseImageDataModule(obs_shape=(1, 28, 28), trn_length=60000, tst_length=None, val_length=10000, sampler='normal',   num_labels=10,  **kwargs),  # alias for normal
+    'noise_mnist_normal':          lambda **kwargs: NoiseImageDataModule(obs_shape=(1, 28, 28), trn_length=60000, tst_length=None, val_length=10000, sampler='normal',   num_labels=10,  **kwargs),
+    'noise_mnist_uniform':         lambda **kwargs: NoiseImageDataModule(obs_shape=(1, 28, 28), trn_length=60000, tst_length=None, val_length=10000, sampler='uniform',  num_labels=10,  **kwargs),
+    'mini_imagenet':               ImageNetMiniDataModule,
+    'noise_mini_imagenet':         lambda **kwargs: NoiseImageDataModule(obs_shape=(3, 84, 84), trn_length=51000, tst_length=None, val_length=9000,  sampler='normal',   num_labels=100, **kwargs),  # alias for normal
+    'noise_mini_imagenet_normal':  lambda **kwargs: NoiseImageDataModule(obs_shape=(3, 84, 84), trn_length=51000, tst_length=None, val_length=9000,  sampler='normal',   num_labels=100, **kwargs),
+    'noise_mini_imagenet_uniform': lambda **kwargs: NoiseImageDataModule(obs_shape=(3, 84, 84), trn_length=51000, tst_length=None, val_length=9000,  sampler='uniform',  num_labels=100, **kwargs),
 }
 
 
 def make_image_data_module(
     dataset: str = 'mnist',
     batch_size: int = 128,
-    normalise: Union[bool, Tuple[float, float]] = False,
+    shift_mean_std: Union[bool, Tuple[float, float]] = True,
     num_workers: int = os.cpu_count(),
-    return_labels: bool = False,
+    return_labels: bool = True,
     **kwargs,
 ) -> ImageDataModule:
     dataset_cls = _DATA_MODULE_CLASSES[dataset]
+    # shift mean and std
+    if isinstance(shift_mean_std, bool):
+        if shift_mean_std:
+            try:
+                shift_mean_std = _DATA_MEAN_STD[dataset]
+            except KeyError:
+                raise KeyError('no default `shift_mean_std` for: {repr(dataset)}, set `shift_mean_std=False`')
+        else:
+            shift_mean_std = (0., 1.)
+    # create data
     return dataset_cls(
         batch_size=batch_size,
-        normalise=normalise,
+        shift_mean_std=shift_mean_std,
         num_workers=num_workers,
         return_labels=return_labels,
         **kwargs,

@@ -1,41 +1,174 @@
 import dataclasses
-import re
-from typing import Optional
+from argparse import Namespace
+from functools import partial
 from typing import Sequence
 from typing import Tuple
+from typing import Type
 from typing import Union
 
 import numpy as np
+import pandas as pd
+import plotly.express as px
 import pytorch_lightning as pl
 import torch
 import wandb
-from pytorch_lightning.loggers import WandbLogger
+from flash.core.classification import ClassificationTask
+from nfnets import ScaledStdConv2d
 from torch import nn
 from torch.nn import functional as F
+from torch.optim import Adam
 
 from exp.data import make_image_data_module
-from exp.nn.model import get_ae_layer_sizes
-from exp.nn.model import make_normalized_model
-from exp.nn.model import norm_activations_analyse
-from exp.util.utils import plot_batch
-from exp.util.utils import print_stats
+from exp.nn.activation import Activation
+from exp.nn.activation import ActivationMaker
+from exp.nn.model import get_layer_sizes
+from exp.nn.weights import init_weights
+from exp.util.nn_utils import find_submodules
+from exp.util.nn_utils import in_out_capture_context
+from exp.util.nn_utils import replace_submodules
+from exp.util.pl_utils import pl_quick_train
+from exp.util.utils import iter_pairs
 
 
-# ========================================================================= #
-# Standard Deviation Slope                                                  #
-# ========================================================================= #
+# ===================================================================== #
+# Layer Handling
+# ===================================================================== #
 
 
-@dataclasses.dataclass
-class SlopeArgs:
-    #     a,   y_0,   y_1
-    # 1.  0.9   0.01 0.25
-    # 2.  0.999 0.01 0.5
-    # 3. -0.9   0.01 0.25
-    # 4. -0.5   0.01 0.25
-    a: float = 0.999
-    y_0: float = 0.01
-    y_n: float = 0.5
+@torch.no_grad()
+def compute_gamma(activation_fn, batch_size=1024, samples=256):
+    # from appendix D: https://arxiv.org/pdf/2101.08692.pdf
+    y = activation_fn(torch.randn(batch_size, samples))
+    gamma = torch.mean(torch.var(y, dim=1))**-0.5
+    return gamma.item()
+
+
+class MeanShift(nn.Module):
+    def __init__(self, wrapped_module: nn.Module):
+        super().__init__()
+        self.mean_shift = nn.Parameter(torch.zeros(1), requires_grad=True)
+        self.wrapped_module = wrapped_module
+        # mark as shifted
+        assert not hasattr(wrapped_module, '_is_mean_shift_wrapped_'), f'module has already been mean shifted: {wrapped_module}'
+        setattr(wrapped_module, '_is_mean_shift_wrapped_', True)
+
+    def forward(self, x):
+        return self.wrapped_module(x) - self.mean_shift
+
+
+def wrap_mean_shift(model: nn.Module, visit_type=(nn.Conv2d, nn.Linear), visit_instance_of=False):
+    """
+    Normal layers sometimes struggle to normalise the activations
+    if the mean is shifted.
+
+    Wrap layers with a learnable parameter that can counteract this.
+    """
+    return replace_submodules(
+        model,
+        visit_type=visit_type,
+        modify_fn=lambda c, k, p: MeanShift(c),
+        visit_instance_of=visit_instance_of,
+    )
+
+
+# ===================================================================== #
+# Layer Handling
+# ===================================================================== #
+
+
+class WandbLayerCallback(pl.Callback):
+    def __init__(self, layers: Sequence[nn.Module], log_period: int = 500):
+        self._layers = layers
+        self._layer_handler = None
+        self._log_period = log_period
+    # logger
+    def batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, outputs, batch, batch_idx, dataloader_idx, log=False):
+        inp_stds, out_stds, inp_means, out_means = self._layer_handler.step()
+        if log and (trainer.global_step % self._log_period == 0):
+            self._layer_handler.wandb_log_plots(inp_stds, out_stds, inp_means, out_means)
+    # hooks
+    def on_fit_start(self, trainer, pl_module): self._layer_handler = LayerStatsHandler(self._layers).start()
+    def on_fit_end(self,   trainer, pl_module): self._layer_handler.end()
+    def on_train_batch_end(self, *args, **kwargs):      self.batch_end(*args, **kwargs, log=True)
+    def on_test_batch_end(self, *args, **kwargs):       self.batch_end(*args, **kwargs, log=False)
+    def on_validation_batch_end(self, *args, **kwargs): self.batch_end(*args, **kwargs, log=False)
+
+
+class LayerStatsHandler(object):
+
+    """
+    The layer handler manages an `in_out_capture_context` around
+    model layers, and computes the mean & std of inputs and outputs
+    to those layers.
+
+    A single method `step` is provided that should be called to
+    reset the stack of captured outputs after a call to the models
+    `forward` method.
+
+    *NB* wrapped nn.Modules should NEVER directly call `forward`,
+         rather they should always use the `__call__` interface which
+        passed variables to registered hooks required by this handler.
+    """
+
+    def __init__(self, layers: Sequence[nn.Module]):
+        self._context_manager = in_out_capture_context(layers=layers, mode='in_out')
+        self._layers = layers
+        self._inp_stack = None
+        self._out_stack = None
+
+    def start(self) -> 'LayerStatsHandler':
+        self._inp_stack, self._out_stack = self._context_manager.__enter__()
+        return self
+
+    def end(self) -> None:
+        self._context_manager.__exit__(None, None, None)
+        return None
+
+    def _get_tensor(self, value) -> torch.Tensor:
+        if isinstance(value, tuple):
+            assert len(value) == 1
+            return value[0]
+        return value
+
+    def step(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        inp_stds, out_stds, inp_means, out_means = [], [], [], []
+        # handle each layer
+        for i in range(len(self._layers)):
+            # compute values
+            inp_stds.append(self._get_tensor(self._inp_stack[i]).std(unbiased=False))
+            out_stds.append(self._get_tensor(self._out_stack[i]).std(unbiased=False))
+            inp_means.append(self._get_tensor(self._inp_stack[i]).mean())
+            out_means.append(self._get_tensor(self._out_stack[i]).mean())
+        # aggregate
+        inp_stds  = torch.stack(inp_stds,  dim=0)
+        out_stds  = torch.stack(out_stds,  dim=0)
+        inp_means = torch.stack(inp_means, dim=0)
+        out_means = torch.stack(out_means, dim=0)
+        # clear stacks
+        self._inp_stack.clear()
+        self._out_stack.clear()
+        # return values
+        return inp_stds, out_stds, inp_means, out_means
+
+    @classmethod
+    def wandb_log_plots(cls, inp_stds, out_stds, inp_means, out_means):
+        entries = [
+            Namespace(values=inp_stds,  label='inp_std', color='red'),
+            Namespace(values=out_stds,  label='out_std', color='red'),
+            Namespace(values=inp_means, label='inp_mean', color='red'),
+            Namespace(values=out_means, label='out_mean', color='red'),
+        ]
+        df = pd.DataFrame([
+            dict(x=x, y=y, label=entry.label)
+            for entry in entries
+            for x, y in enumerate(entry.values.detach().cpu().numpy().tolist())
+        ])
+        wandb.log({'layer_stats': px.line(df, x='x', y='y', color='label', title='Layer Input Standard Deviation')})
+
+
+# ===================================================================== #
+# Layer Regularisation
+# ===================================================================== #
 
 
 def std_slope(n: int, a: float, y_0: float = 0.001, y_n: float = 1.0, zero_is_flat=False, tensor=True):
@@ -59,363 +192,450 @@ def std_slope(n: int, a: float, y_0: float = 0.001, y_n: float = 1.0, zero_is_fl
     return y
 
 
-# ========================================================================= #
-# Helper                                                                    #
-# ========================================================================= #
+@dataclasses.dataclass
+class SlopeArgs:
+    #     a,   y_0,   y_1
+    # 1.  0.9   0.01 0.25
+    # 2.  0.999 0.01 0.5
+    # 3. -0.9   0.01 0.25
+    # 4. -0.5   0.01 0.25
+    a: float = 0.999
+    y_0: float = 0.01
+    y_n: float = 0.5
+
+    def to_slope(self, n: int) -> torch.Tensor:
+        return std_slope(n=n, a=self.a, y_0=self.y_0, y_n=self.y_n, zero_is_flat=False, tensor=True)
 
 
-class SimpleSystem(pl.LightningModule):
+MeanStdTargetHint = Union[float, torch.Tensor, SlopeArgs]
+
+
+def to_mean_or_std_target(n: int, target: MeanStdTargetHint) -> torch.Tensor:
+    if isinstance(target, torch.Tensor):
+        pass
+    elif isinstance(target, SlopeArgs):
+        target = target.to_slope(n)
+    else:
+        target = torch.full([n], fill_value=float(target))
+    assert target.shape == (n,)
+    return target
+
+
+# ===================================================================== #
+# Layer Regularisation
+# ===================================================================== #
+
+
+def normalize_targets(y: torch.Tensor, y_targ: torch.Tensor, model_type='classification') -> torch.Tensor:
+    if model_type == 'classification':
+        assert y.ndim == 2
+        assert y_targ.ndim == 1
+        assert y.shape[0] == y_targ.shape[0]
+        return F.one_hot(y_targ, num_classes=y.shape[-1]).float()
+    elif model_type == 'regression':
+        assert y.shape == y_targ.shape
+        return y_targ, {}
+    else:
+        raise KeyError(f'invalid normalize target model type: {repr(model_type)}')
+
+
+class RegularizeLayerStatsTask(pl.LightningModule):
 
     def __init__(
         self,
-        model_hidden_sizes: Sequence[int] = (128, 32, 128),
-        model_activation: str = 'tanh',
-        model_init_mode: str = 'xavier_normal',
-        model_batch_norm: bool = False,
-        model_obs_shape: Tuple[int, int, int] = (1, 28, 28),
-        # optimizer
-        lr: float = 1e-3,
-        # normalising
-        norm_samples: Optional[int] = None,
-        norm_sampler: str = 'normal',
-        norm_steps: int = 2500,
-        norm_batch_size: int = 256,
-        norm_lr=1e-2,
-        norm_targets_mean: Union[float, torch.Tensor] = 0.0,
-        norm_targets_std: Union[float, torch.Tensor] = 1.0,
-        # extra hparams
-        **extra_hparams,
+        model: nn.Module,
+        layers: Sequence[nn.Module],
+        model_type='regression',
+        # mean & std settings
+        target_mean: MeanStdTargetHint = 0.,
+        target_std: MeanStdTargetHint = 1.,
+        reg_model_output: bool = True,
+        # early stopping
+        early_stop_value: float = 0.001,
+        early_stop_exp_weight: float = 0.98,
+        # optimizer settings
+        optimizer: Type[torch.optim.Optimizer] = torch.optim.Adam,
+        optimizer_kwargs: dict = None,
+        learning_rate: float = 1e-3,
+        # logging settings
+        log_wandb_period: int = None,
+        log_data_stats: bool = False,
     ):
         super().__init__()
-        self.save_hyperparameters()
-        # compute params
-        self.hparams.num_layers = len(self.hparams.model_hidden_sizes) + 1
-        self.hparams.hidden_beg_size = self.hparams.model_hidden_sizes[0]
-        self.hparams.hidden_mid_size = self.hparams.model_hidden_sizes[len(self.hparams.model_hidden_sizes)//2]
-        self.hparams.hidden_end_size = self.hparams.model_hidden_sizes[-1]
-        # make model
-        self._base_model, _, self.title = make_normalized_model(
-            model_sizes=[np.prod(model_obs_shape), *model_hidden_sizes, np.prod(model_obs_shape)],
-            model_activation=model_activation,
-            model_init_mode=model_init_mode,
-            model_batch_norm=model_batch_norm,
-            test_steps=128,
-            test_batch_size=32,
-            norm_samples=norm_samples,
-            norm_sampler=norm_sampler,
-            norm_steps=norm_steps,
-            norm_batch_size=norm_batch_size,
-            norm_lr=norm_lr,
-            norm_targets_mean=norm_targets_mean,
-            norm_targets_std=norm_targets_std,
-            stats=True,
-            log=True,
-        )
-        # init model
-        self._model = nn.Sequential(
-            nn.Flatten(start_dim=1),
-            self._base_model,
-            nn.Unflatten(dim=1, unflattened_size=model_obs_shape),
-        )
+        self.save_hyperparameters(ignore=['model', 'layers'])
+        self.hparams.optimizer_kwargs = self.hparams.optimizer_kwargs if self.hparams.optimizer_kwargs else {}
+        # initialise
+        self._model = model
+        self._layer_handler = None
+        self._layers = layers
+        # normalise targets & store as paramter
+        self._target_mean: torch.Tensor
+        self._target_std: torch.Tensor
+        self.register_buffer('_target_mean', to_mean_or_std_target(len(layers), target_mean))
+        self.register_buffer('_target_std', to_mean_or_std_target(len(layers), target_std))
+        # early stopping values
+        self._early_stop_moving_ave = None
 
-    def forward(self, x):
-        return self._model(x)
+    def on_train_epoch_start(self, *args, **kwargs) -> None:
+        self._layer_handler = LayerStatsHandler(self._layers).start()
 
-    def training_step(self, batch, batch_idx):
-        y = self(batch)
-        loss = F.mse_loss(y, batch, reduction='mean')
-        self.log('loss', loss)
+    def on_train_epoch_end(self, *args, **kwargs) -> None:
+        self._layer_handler = self._layer_handler.end()
+
+    def _early_stop_update(self, loss: float):
+        # update the exponential moving average
+        if self._early_stop_moving_ave is None:
+            self._early_stop_moving_ave = loss
+        else:
+            self._early_stop_moving_ave = self.hparams.early_stop_exp_weight * self._early_stop_moving_ave \
+                                          + (1 - self.hparams.early_stop_exp_weight) * loss
+        # log values
+        self.log('early_stop_value', self._early_stop_moving_ave)
+        self.log('early_stop_target', self.hparams.early_stop_value)
+        # stop early if we have succeeded!
+        if self._early_stop_moving_ave < self.hparams.early_stop_value:
+            self.trainer.should_stop = True
+
+    def training_step(self, x, batch_idx):
+        x, y_targ = (x, x) if isinstance(x, torch.Tensor) else x
+
+        # feed forward for layer hook
+        y = self._model(x)
+        inp_std, out_std, inp_mean, out_mean = self._layer_handler.step()
+        y_targ = normalize_targets(y, y_targ, model_type=self.hparams.model_type)
+
+        # compute data stats
+        y_mean, y_std = y.mean(), y.std(unbiased=True)
+        y_targ_mean, y_targ_std = y_targ.mean(), y_targ.std(unbiased=True)
+
+        if self.hparams.log_data_stats:
+            self.log('μ_x', x.mean(),              prog_bar=True)
+            self.log('σ_x', x.std(unbiased=True),  prog_bar=True)
+            self.log('μ_y', y_mean,                prog_bar=True)
+            self.log('σ_y', y_std,                 prog_bar=True)
+            self.log('μ_t', y_targ_mean,           prog_bar=True)
+            self.log('σ_t', y_targ_std,            prog_bar=True)
+
+        # compute target regularize loss
+        loss_targ_mean, loss_targ_std = 0, 0
+        if self.hparams.reg_model_output:
+            loss_targ_mean  = F.mse_loss(y_mean, y_targ_mean)
+            loss_targ_std   = F.mse_loss(y_std,  y_targ_std)
+        loss_layer_mean = F.mse_loss(out_mean, self._target_mean)
+        loss_layer_std  = F.mse_loss(out_std,  self._target_std)
+        loss = loss_layer_mean + loss_layer_std + loss_targ_mean + loss_targ_std
+
+        # update early stopping moving average
+        self._early_stop_update(loss.item())
+
+        # log everything
+        self.log('l_σ', loss_layer_std,  prog_bar=True)
+        self.log('l_μ',  loss_layer_mean, prog_bar=True)
+        self.log('t_σ', loss_targ_std,   prog_bar=True)
+        self.log('t_μ',  loss_targ_mean,  prog_bar=True)
+        self.log('train_loss', loss)
+
+        # log plots
+        if self.hparams.log_wandb_period is not None:
+            if self.trainer.global_step % self.hparams.log_wandb_period == 0:
+                self._layer_handler.wandb_log_plots(inp_std, out_std, inp_mean, out_mean)
+
         return loss
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self._model.parameters(), lr=self.hparams.lr)
-
-    @classmethod
-    def quick_mnist_train(
-        cls,
-        # trainer
-        dataset: str = 'mnist',
-        epochs: int = 100,
-        batch_size: int = 128,
-        # model settings
-        model_hidden_sizes: Sequence[int] = (128, 32, 128),
-        model_activation: str = 'tanh',
-        model_init_mode: str = 'xavier_normal',
-        model_batch_norm: bool = False,
-        # optimizer
-        lr: float = 1e-3,
-        # normalising
-        norm_samples: Optional[int] = None,
-        norm_sampler: str = 'normal',
-        norm_steps: int = 2500,
-        norm_batch_size: int = 256,
-        norm_lr=1e-2,
-        norm_targets_mean: Union[float, torch.Tensor] = 0.0,
-        norm_targets_std: Union[SlopeArgs, float, torch.Tensor] = 1.0,
-        # wandb settings
-        log_wandb: bool = False,
-        wandb_name: str = '',
-        wandb_tags: Optional[Sequence[str]] = None,
-        wandb_project: str = 'weight-init',
-    ):
-        extra_hparams = dict(
-            dataset=dataset,
-            epochs=epochs,
-            batch_size=batch_size,
+        return self.hparams.optimizer(
+            self._model.parameters(),
+            lr=self.hparams.learning_rate,
+            **self.hparams.optimizer_kwargs,
         )
 
-        # normalise parameters & extend hparams if needed
-        if isinstance(norm_targets_std, SlopeArgs):
-            extra_hparams.update(dict(
-                targ_std_slope=norm_targets_std.a,
-                targ_std_y_0=norm_targets_std.y_0,
-                targ_std_y_n=norm_targets_std.y_n,
-            ))
-            norm_targets_std = std_slope(
-                n=len(model_hidden_sizes),
-                a=norm_targets_std.a,
-                y_0=norm_targets_std.y_0,
-                y_n=norm_targets_std.y_n,
-            )
 
-        # get the data
-        data = make_image_data_module(dataset=dataset, batch_size=batch_size, normalise=True)
+def has_kwarg(fn, name: str):
+    import inspect
+    params = inspect.signature(fn).parameters
+    return name in params
 
-        # make the model
-        model = cls(
-            model_hidden_sizes=model_hidden_sizes,
-            model_activation=model_activation,
-            model_init_mode=model_init_mode,
-            model_batch_norm=model_batch_norm,
-            model_obs_shape=data.obs_shape,
-            lr=lr,
-            norm_samples=norm_samples,
-            norm_sampler=norm_sampler,
-            norm_steps=norm_steps,
-            norm_batch_size=norm_batch_size,
-            norm_lr=norm_lr,
-            norm_targets_mean=norm_targets_mean,
-            norm_targets_std=norm_targets_std,
-            # log extra hparams
-            **extra_hparams,
+
+# ===================================================================== #
+# Modules
+# ===================================================================== #
+
+
+class RandomLinear(nn.Linear):
+
+    def __init__(self, in_features: int, out_features: int, p: float = 0.5):
+        assert 0 < p <= 1
+        # modify values
+        p_in = int(max(in_features * p, 1))
+        # initialise
+        super().__init__(p_in, out_features)
+        # create random values
+        self.shuffle_idxs: torch.Tensor
+        self.register_buffer('shuffle_idxs', torch.randint(0, in_features, size=(out_features, p_in)))
+
+    def forward(self, x: torch.Tensor):
+        assert x.ndim == 2
+        x = x[:, self.shuffle_idxs]
+        y = (x * self.weight[None]).sum(dim=-1) + self.bias
+        return y
+
+
+# ===================================================================== #
+# Models
+# ===================================================================== #
+
+
+def _make_linear_layers(in_shape, out_shape, hidden_sizes, ActType):
+    # get sizes
+    sizes = [int(np.prod(in_shape)), *hidden_sizes, int(np.prod(out_shape))]
+    pairs = iter_pairs(sizes)
+    # get linear layers
+    layers = [m for inp, out in pairs for m in [nn.Linear(inp, out), ActType()]][:-1]
+    # make layers
+    return nn.Sequential(
+        nn.Flatten(),
+        *layers,
+        nn.Unflatten(dim=-1, unflattened_size=out_shape)
+    )
+
+
+def make_model(name: str, Conv2dType=nn.Conv2d, ActType=nn.ReLU):
+    # activations occur inplace
+    if has_kwarg(ActType, 'inplace'):
+        ActType = partial(ActType, inplace=True)
+    # create the model
+    if name == 'mnist_simple_fc_deep':
+        return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(10,), hidden_sizes=get_layer_sizes(128, 16, r=10), ActType=ActType)
+    if name == 'mnist_simple_fc_deep_wide':
+        return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(10,), hidden_sizes=get_layer_sizes(256, 64, r=10), ActType=ActType)
+    elif name == 'mnist_simple_fc':
+        return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(10,), hidden_sizes=get_layer_sizes(128, 16, r=2), ActType=ActType)
+    elif name == 'mnist_simple_fc_wide':         # 850 K e:4=97.9%
+        return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(10,), hidden_sizes=get_layer_sizes(512, 128, r=2), ActType=ActType)
+    # elif name == 'mnist_simple_ae_deep':
+    #     return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(1, 28, 28), hidden_sizes=get_ae_layer_sizes(128, 16, r=10), ActType=ActType)
+    elif name == 'mnist_simple_conv':
+        return nn.Sequential(
+            Conv2dType(1,  32, kernel_size=3, padding=1), ActType(),
+            Conv2dType(32, 16, kernel_size=3, padding=1), ActType(),
+                nn.AvgPool2d(kernel_size=2),  # 28x28 -> 14x14
+            Conv2dType(16, 32, kernel_size=3, padding=1), ActType(),
+            Conv2dType(32,  8, kernel_size=3, padding=1), ActType(),
+                nn.AvgPool2d(kernel_size=2),  # 14x14 -> 7x7
+                nn.Flatten(),
+            nn.Linear(7*7*8, 128), nn.Dropout(p=0.5), ActType(),
+            nn.Linear(128, 10),
         )
+    elif name == 'mnist_simple_conv_large':
+        return nn.Sequential(
+            Conv2dType(1,  32, kernel_size=3, padding=1), ActType(),
+            Conv2dType(32, 64, kernel_size=3, padding=1), ActType(),
+                nn.AvgPool2d(kernel_size=2),  # 28x28 -> 14x14
+            Conv2dType(64, 64, kernel_size=3, padding=1), ActType(),
+            Conv2dType(64, 96, kernel_size=3, padding=1), ActType(),
+                nn.AvgPool2d(kernel_size=2),  # 14x14 -> 7x7
+            Conv2dType(96, 128, kernel_size=3, padding=1), ActType(),
+            Conv2dType(128, 96,  kernel_size=3, padding=1), ActType(),
+                nn.AvgPool2d(kernel_size=2),  # 7x7 -> 3x3
+                nn.Flatten(),
+            nn.Linear(3*3*96, 256), nn.Dropout(p=0.5), ActType(),
+            nn.Linear(256, 10),
+        )
+    elif name == 'mini_imagenet_simple_conv':
+        return nn.Sequential(
+            Conv2dType(3,  16, kernel_size=3, padding=1), ActType(),
+            Conv2dType(16, 32, kernel_size=3, padding=1), ActType(),
+                nn.AvgPool2d(kernel_size=3),  # 84x84 -> 28x28
+            Conv2dType(32, 64, kernel_size=3, padding=1), ActType(),
+            Conv2dType(64, 32, kernel_size=3, padding=1), ActType(),
+                nn.AvgPool2d(kernel_size=2),  # 28x28 -> 14x14
+            Conv2dType(32, 64, kernel_size=3, padding=1), ActType(),
+            Conv2dType(64, 16, kernel_size=3, padding=1), ActType(),
+                nn.AvgPool2d(kernel_size=2),  # 14x14 -> 7x7
+                nn.Flatten(),
+            nn.Linear(7*7*16, 384), nn.Dropout(p=0.5), ActType(),
+            nn.Linear(384, 100),
+        )
+    else:
+        raise KeyError(f'invalid model name: {repr(name)}')
 
-        # train the model
-        trainer = pl.Trainer(
-            max_epochs=epochs,
-            weights_summary='full',
-            checkpoint_callback=False,
-            logger=False if (not log_wandb) else WandbLogger(
-                name=(wandb_name + re.sub(r'[\s|]+', '_', model.title).strip('_')).lower(),
-                project=wandb_project,
-                tags=wandb_tags
+
+def make_conv_model_and_reg_layers(name: str, Conv2dType=nn.Conv2d, ActType=nn.ReLU, init_mode: str = None, mean_shift_activations: bool = None, include_last: bool = False):
+    # make model
+    model = make_model(name, ActType=ActType, Conv2dType=Conv2dType)
+    # relu needs mean_shift
+    if (mean_shift_activations is None) and (ActType == nn.ReLU):
+        mean_shift_activations = True
+    # mean shift
+    if mean_shift_activations:
+        print('[mean shift]:', wrap_mean_shift(model))
+    # initialise model weights
+    if init_mode:
+        init_weights(model, mode=init_mode)
+    # get layers
+    layers = find_submodules(model, (Conv2dType(1, 1, 1).__class__, nn.Linear), visit_instance_of=True)
+    if not include_last:
+        layers = layers[:-1]
+    # return values
+    return model, layers
+
+
+def get_conv_type(conv_type: str, activation: str):
+    # compute gamma for ScaledStdConv2d
+    gamma = compute_gamma(Activation(activation))
+    print('\033[93m', 'GAMMA: ', gamma, '\033[0m', sep='')
+    # get the conv maker
+    if conv_type == 'scaled_conv':
+        return lambda *args, **kwargs: ScaledStdConv2d(*args, **kwargs, gamma=gamma, use_layernorm=True)
+    elif conv_type == 'conv':
+        return nn.Conv2d
+    else:
+        raise KeyError(f'invalid conv_type: {repr(conv_type)}')
+
+
+# ===================================================================== #
+# Main
+# ===================================================================== #
+
+
+def __main__(
+    task = 'classify',
+    # wandb
+    wandb_enabled: bool = False,
+    wandb_project: str = 'weights-test',
+    # model settings
+    model: str = 'simple_fc_deep',
+    model_activation: str = 'swish',
+    model_conv: str = 'conv',
+    model_init_mode: str = 'xavier_normal',
+    # dataset
+    dataset: str = 'mnist',
+    # regularisation settings
+    regularize: bool = True,
+    reg_target_mean: MeanStdTargetHint = 0.0,
+    reg_target_std: MeanStdTargetHint = 1.0,
+    reg_with_noise=True,
+    reg_model_output=True,
+    # optimizers
+    reg_lr: float = 1e-3,
+    reg_batch_size: int = 128,
+    train_lr: float = 1e-3,
+    train_batch_size: int = 128,
+    train_epochs: int = 30,
+    train_optimizer: Type[torch.optim.Optimizer] = Adam,
+    train_optimizer_kwargs=None,
+    # schedule
+    train_scheduler=None,
+    train_scheduler_kwargs=None,
+):
+    hparams = locals().copy()
+
+    # TODO: add AE task!
+    assert task == 'classify', 'other tasks are not yet supported'
+
+    # get name
+    wandb_name = f'{model_activation}:{model_conv}:{model_init_mode}:{model}|{getattr(train_optimizer, "__name__", train_optimizer)}:{regularize}|{task}'
+
+    # make the model
+    model, layers = make_conv_model_and_reg_layers(
+        name=f'{dataset}_{model}',
+        ActType=ActivationMaker(activation=model_activation),
+        Conv2dType=get_conv_type(conv_type=model_conv, activation=model_activation),
+        init_mode=model_init_mode,
+        include_last=not reg_model_output,
+    )
+
+    print(f'REG LAYERS: {len(layers)}')
+
+    trainer = None
+    if regularize:
+        reg_data = make_image_data_module(
+            dataset=f'noise_{dataset}' if reg_with_noise else f'{dataset}',
+            batch_size=reg_batch_size,
+            shift_mean_std=True,
+            return_labels=True,
+        )
+        # regularize the network
+        _, _, trainer = pl_quick_train(
+            system=RegularizeLayerStatsTask(
+                target_mean=reg_target_mean,
+                target_std=reg_target_std,
+                early_stop_value=0.01,
+                model=model,
+                model_type='classification',
+                layers=layers,
+                optimizer=train_optimizer,
+                optimizer_kwargs=train_optimizer_kwargs if train_optimizer_kwargs else {},
+                log_wandb_period=None,
+                learning_rate=reg_lr,
+                reg_model_output=reg_model_output,
+                log_data_stats=False,
             ),
-            gpus=1 if torch.cuda.is_available() else 0,
+            data=reg_data,
+            train_epochs=3,
+            train_steps=2000,
+            wandb_enabled=wandb_enabled,
+            wandb_project=wandb_project,
+            wandb_name=wandb_name,
+            hparams=hparams,
         )
-        trainer.fit(model, data)
+        del reg_data, _
 
-        # get data and vis batch
-        with torch.no_grad():
-            if torch.cuda.is_available():
-                model = model.cuda()
-            img_batch = data.sample_display_batch(9).cpu()
-            out_batch = model(img_batch.to(model.device)).cpu()
-            plot_batch(img_batch, out_batch, mean_std=data.norm_mean_std, clip=True)
-
-        # print final stats
-        train_values, train_stats = norm_activations_analyse(model._base_model, obs_shape=[28 * 28], sampler=norm_sampler, steps=128, batch_size=32)
-        print_stats(train_stats,  title=f'{model.title} | TRN STAT')
-        print_stats(train_values, title=f'{model.title} | TRN VALS')
-
-        # FINISHED
-        if log_wandb:
-            wandb.finish()
-
-        # return everything
-        return model, data
+    # train the network
+    _, _, _ = pl_quick_train(
+        system=ClassificationTask(
+            model,
+            loss_fn=F.cross_entropy,
+            optimizer=train_optimizer,
+            optimizer_kwargs=train_optimizer_kwargs if train_optimizer_kwargs else {},
+            learning_rate=train_lr,
+            scheduler=train_scheduler,
+            scheduler_kwargs=train_scheduler_kwargs,
+        ),
+        data=make_image_data_module(
+            dataset=f'{dataset}',
+            batch_size=train_batch_size,
+            shift_mean_std=True,
+            return_labels=True,
+        ),
+        train_epochs=train_epochs,
+        wandb_enabled=wandb_enabled,
+        wandb_project=wandb_project,
+        wandb_name=wandb_name,
+        logger=trainer.logger if (trainer is not None) else None,
+        train_callbacks=[WandbLayerCallback(layers, log_period=500)] if wandb_enabled else [],
+    )
+    del _
+    return model
 
 
 if __name__ == '__main__':
 
-    # ===================================================================== #
-    # SETTINGS
-    # ===================================================================== #
+    # 99.6 % after 3rd epoch
+    # 99.7 % after ~15-20 epochs
 
-    _SHARED_KWARGS = dict(
-        model_hidden_sizes=get_ae_layer_sizes(start=128, mid=32, r=10),
-        epochs=15,
-        log_wandb=True,
-        wandb_name='TEMP_',
-        wandb_tags=[],
+    __main__(
+        wandb_enabled=True,
+        # model settings
         dataset='mnist',
+        model='simple_fc_deep',
+        model_activation='swish',
+        model_conv='scaled_conv',
+        model_init_mode='xavier_normal',
+        # regularisation settings
+        # NOTE: no reg seems to be better unfortunately -- just use ScaledStdConv2d with xavier_normal init
+        regularize=False,
+        reg_lr=5e-4,
+        reg_target_std=1.0, # SlopeArgs(a=-0.95, y_0=2, y_n=17.0),
+        reg_with_noise=True,
+        reg_model_output=True,
+        # training settings
+        train_lr=1e-3,
+        train_epochs=100,
+        train_optimizer=torch.optim.Adam,  # Adam, RAdam,
+        # train_optimizer_kwargs=dict(eps=1e-5, weight_decay=1e-5),
+        # train_optimizer_kwargs=dict(eps=1e-5, weight_decay=1e-5),
+        # scheduler
+        train_scheduler=torch.optim.lr_scheduler.MultiStepLR,
+        train_scheduler_kwargs=dict(gamma=10**(-0.5), milestones=[1, 2, 3, 10], verbose=True),
     )
-
-    # ===================================================================== #
-    # 4. BASE RUNS
-    # ===================================================================== #
-
-    for activation in [
-        'swish',
-        'tanh',
-        'relu',
-    ]:
-        for init_mode in [
-            'xavier_normal',
-            'kaiming_normal',
-            'xavier_uniform',
-            'kaiming_uniform',
-        ]:
-            SimpleSystem.quick_mnist_train(
-                model_activation=activation,
-                model_init_mode=init_mode,
-                # targets
-                norm_targets_mean=0,
-                norm_targets_std=1,
-                # shared
-                **{
-                    **_SHARED_KWARGS,
-                    **dict(
-                        epochs=30,
-                        wandb_name=f'base:_',
-                        wandb_tags=('BASE',)
-                    ),
-                },
-            )
-
-    # ===================================================================== #
-    # 3. BEST REPEATS
-    # ===================================================================== #
-
-    for i in range(3):
-        for s in [
-            SlopeArgs(a=0.9,   y_0=0.01, y_n=0.25),  # 1.
-            SlopeArgs(a=0.999, y_0=0.01, y_n=0.5),   # 2.
-            SlopeArgs(a=-0.9,  y_0=0.01, y_n=0.25),  # 3.
-            SlopeArgs(a=-0.5,  y_0=0.01, y_n=0.25),  # 4.
-        ]:
-            SimpleSystem.quick_mnist_train(
-                model_activation='norm_swish',
-                model_init_mode='xavier_normal',
-                # targets
-                norm_targets_mean=0,
-                norm_targets_std=s,
-                # shared
-                **{
-                    **_SHARED_KWARGS,
-                    **dict(
-                        epochs=30,
-                        wandb_name=f'rerun:slope={s.a}:beg={s.y_0}:end={s.y_n}_',
-                        wandb_tags=('RERUN',)
-                    ),
-                },
-            )
-
-    # # ===================================================================== #
-    # # 2. SEARCH
-    # # ===================================================================== #
-    #
-    # for y_n in [0.99, 0.75, 0.5, 0.25, 0.01]:                # should add 0.1
-    #     for y_0 in [0.01, 0.25, 0.5, 0.75, 0.99]:            # should add 0.1
-    #         for a in [0.999, 0.9, 0.5, -0.5, -0.9, -0.999]:  # should add 0.25, 0.1, -0.1, -0.25
-    #             try:
-    #                 SimpleSystem.quick_mnist_train(
-    #                     model_activation='norm_swish',
-    #                     model_init_mode='xavier_normal',
-    #                     # targets
-    #                     norm_targets_mean=0,
-    #                     norm_targets_std=SlopeArgs(a=a, y_0=y_0, y_n=y_n),
-    #                     # shared
-    #                     **{**_SHARED_KWARGS, 'wandb_name': f'T:slope={a}:beg={y_0}:end={y_n}_'},
-    #                 )
-    #             except:
-    #                 print('Failed')
-    #             try:
-    #                 wandb.finish()
-    #             except:
-    #                 pass
-    #
-    # # ===================================================================== #
-    # # 1. TANH - BASE
-    # # ===================================================================== #
-    #
-    # SimpleSystem.quick_mnist_train(
-    #     model_activation='tanh',
-    #     model_init_mode='custom',
-    #     # targets
-    #     norm_targets_mean=0,
-    #     norm_targets_std=1,
-    #     # shared
-    #     **_SHARED_KWARGS,
-    # )
-    #
-    # TANH : BEFORE TRAIN - custom
-    # μ: [-0.001, -0.001, -0.001,  0.000, -0.001, -0.000,  0.001,  0.000, -0.000, -0.000, -0.000, -0.001, -0.000, -0.000,  0.000, -0.000, -0.000, -0.000, -0.000,  0.000,  0.000]
-    # σ: [ 0.627,  0.486,  0.403,  0.355,  0.314,  0.291,  0.272,  0.259,  0.240,  0.233,  0.218,  0.205,  0.196,  0.182,  0.184,  0.180,  0.172,  0.169,  0.164,  0.155,  0.153]
-    #
-    # TANH : AFTER TRAIN - custom
-    # μ: [ 0.001, -0.001,  0.001,  0.001,  0.001, -0.002, -0.002,  0.001, -0.003, -0.008, -0.001, -0.000,  0.001, -0.018,  0.029, -0.014,  0.008, -0.008, -0.032,  0.013,  0.032]
-    # σ: [ 0.647,  0.513,  0.450,  0.419,  0.390,  0.380,  0.363,  0.346,  0.332,  0.324,  0.327,  0.312,  0.315,  0.328,  0.377,  0.438,  0.500,  0.547,  0.557,  0.554,  0.500]
-    #
-    # NORMTANH : AFTER TRAIN - custom
-    # μ: [-0.015, -0.006, -0.007,  0.003, -0.004,  0.001,  0.000, -0.001, -0.008,  0.015, -0.011, -0.017, -0.009,  0.003,  0.006,  0.005,  0.000, -0.001, -0.005, -0.002,  0.018]
-    # σ: [ 1.011,  1.016,  1.031,  1.058,  1.065,  1.086,  1.105,  1.130,  1.152,  1.149,  1.107,  1.084,  1.080,  1.087,  1.098,  1.149,  1.149,  1.183,  1.227,  1.205,  0.924]
-    #
-    # # ===================================================================== #
-    # # 1. SETTINGS FROM TANH FOR SWISH (even applied to swish) WORK WELL!
-    # # ===================================================================== #
-    #
-    # # TANH : BEFORE TRAIN - custom
-    # targs_mean = [-0.001, -0.001, -0.001,  0.000, -0.001, -0.000,  0.001,  0.000, -0.000, -0.000, -0.000, -0.001, -0.000, -0.000,  0.000, -0.000, -0.000, -0.000, -0.000,  0.000,  0.000]
-    # targs_std  = [ 0.627,  0.486,  0.403,  0.355,  0.314,  0.291,  0.272,  0.259,  0.240,  0.233,  0.218,  0.205,  0.196,  0.182,  0.184,  0.180,  0.172,  0.169,  0.164,  0.155,  0.153]
-    #
-    # # reverse -- large at end -- works well
-    # targs_mean = targs_mean[::-1]
-    # targs_std  = targs_std[::-1]
-    #
-    # # to tensor
-    # targs_mean = torch.as_tensor(targs_mean)
-    # targs_std = torch.as_tensor(targs_std)
-    #
-    # # adjust -- works well (but not needed)
-    # # targs_mean = targs_mean ** 2
-    # # targs_std = targs_std ** 2
-    #
-    # SimpleSystem.quick_mnist_train(
-    #     model_activation='norm_swish',
-    #     model_init_mode='xavier_normal',
-    #     # targets
-    #     norm_targets_mean=targs_mean,
-    #     norm_targets_std=targs_std,
-    #     # shared
-    #     **_SHARED_KWARGS,
-    # )
-    #
-    # # LOGS:
-    # # normalising model: 100%|██████████| 1500/1500 [00:20<00:00, 72.33it/s, loss=0.00249]
-    # # [ 32 784  11 | norm_swish         | normal          | xavier_normal   | BFR] - μ: [▸█▆▅▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄◂] σ: [▸▃▂▁▁                 ◂] | μ: [ 0.325,  0.169,  0.075,  0.029,  0.002,  0.001,  0.003,  0.001, -0.000,  0.000, -0.000,  0.000,  0.000, -0.000,  0.000, -0.000, -0.000,  0.000,  0.000, -0.000, -0.000] σ: [ 0.755,  0.470,  0.282,  0.155,  0.079,  0.040,  0.021,  0.010,  0.005,  0.003,  0.001,  0.001,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000]
-    # # [ 32 784  11 | norm_swish         | normal          | xavier_normal   | AFT] - μ: [▸▄▄▄▅▃▄▄▄▃▅▄▄▄▄▄▄▄▄▄▄▄◂] σ: [▸▁                 ▁▁▂◂] | μ: [-0.000,  0.004, -0.000,  0.008, -0.018, -0.001,  0.006, -0.005, -0.014,  0.007,  0.002, -0.005, -0.006, -0.001, -0.003, -0.003,  0.002,  0.002, -0.001,  0.002,  0.004] σ: [ 0.242,  0.062,  0.026,  0.028,  0.017,  0.033,  0.035,  0.037,  0.040,  0.042,  0.052,  0.057,  0.060,  0.070,  0.081,  0.090,  0.106,  0.136,  0.175,  0.255,  0.427]
-    # # [ 32 784  11 | norm_swish         | normal          | xavier_normal   | DIF] - μ: [▸ ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄◂] σ: [▸ ▂▄▅▄▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅◂] | μ: [-0.325, -0.006, -0.001,  0.004, -0.017,  0.001,  0.002, -0.004, -0.004,  0.007,  0.003, -0.003, -0.003, -0.005, -0.007,  0.004,  0.005,  0.002, -0.008, -0.005,  0.002] σ: [-2.118, -1.011, -0.245,  0.538,  0.093,  0.600,  0.521,  0.503,  0.482,  0.474,  0.500,  0.596,  0.588,  0.612,  0.564,  0.535,  0.554,  0.620,  0.636,  0.662,  0.707]
-    # # Epoch 99: 100%|██████| 469/469 [00:14<00:00, 32.09it/s, loss=0.0341, v_num=yo9x]
-    # # [ 32 784  11 | norm_swish         | normal          | xavier_normal   | TRN] - μ: [▸▅▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▂ ◂] σ: [▸▂                ▁▁▁▂◂] | μ: [ 0.113,  0.036, -0.009, -0.016, -0.012, -0.021, -0.015, -0.006, -0.008, -0.001,  0.004, -0.003, -0.008, -0.009, -0.014, -0.021, -0.025, -0.025, -0.042, -0.129, -0.341] σ: [ 0.425,  0.149,  0.079,  0.115,  0.080,  0.109,  0.113,  0.110,  0.100,  0.089,  0.082,  0.080,  0.086,  0.107,  0.125,  0.137,  0.153,  0.194,  0.274,  0.390,  0.541]
-    #
-    # # ===================================================================== #
-    # # 1. SWISH - REFERENCE
-    # # ===================================================================== #
-    #
-    # SimpleSystem.quick_mnist_train(
-    #     model_activation='swish',
-    #     model_init_mode='xavier_normal',
-    #     # targets
-    #     norm_steps=1,
-    #     norm_targets_mean=0,
-    #     norm_targets_std=1,
-    #     # shared
-    #     **_SHARED_KWARGS,
-    # )
-    #
-    # # LOGS:
-    # # [ 32 784  11 | swish              | normal          | xavier_normal   | BFR] - μ: [▸█▆▅▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄◂] σ: [▸▃▂▁▁                 ◂] | μ: [ 0.325,  0.137,  0.042,  0.034,  0.015,  0.002,  0.002,  0.000, -0.001,  0.000,  0.000, -0.000,  0.000, -0.000,  0.000, -0.000, -0.000, -0.000, -0.000,  0.000,  0.000] σ: [ 0.757,  0.465,  0.261,  0.144,  0.082,  0.041,  0.021,  0.011,  0.006,  0.003,  0.002,  0.001,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000]
-    # # [ 32 784  11 | swish              | normal          | xavier_normal   | AFT] - μ: [▸█▆▅▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄◂] σ: [▸▃▂▁▁                 ◂] | μ: [ 0.324,  0.137,  0.042,  0.034,  0.015,  0.002,  0.002,  0.000, -0.001,  0.000,  0.000,  0.000,  0.000, -0.000,  0.000, -0.000, -0.000, -0.000, -0.000,  0.000,  0.000] σ: [ 0.755,  0.466,  0.262,  0.145,  0.082,  0.041,  0.021,  0.011,  0.006,  0.003,  0.002,  0.001,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000]
-    # # [ 32 784  11 | swish              | normal          | xavier_normal   | DIF] - μ: [▸▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄◂] σ: [▸▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄◂] | μ: [ 0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000] σ: [ 0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000,  0.000]
-    # # Epoch 99: 100%|███████| 469/469 [00:13<00:00, 33.85it/s, loss=0.077, v_num=y08c]
-    # # [ 32 784  11 | swish              | normal          | xavier_normal   | TRN] - μ: [▸█▇▆▆▆▅▅▅▅▅▆▅▅▄▄▄▄▄▄▄▄◂] σ: [▸██▇▆▅▄▄▄▄▄▄▃▃▃▃▂▂▂▂▂▂◂] | μ: [ 1.349,  1.081,  0.764,  0.653,  0.512,  0.467,  0.388,  0.398,  0.361,  0.432,  0.519,  0.270,  0.177,  0.082,  0.084,  0.060,  0.052,  0.031,  0.037,  0.036, -0.090] σ: [ 2.425,  2.486,  1.942,  1.603,  1.296,  1.144,  1.040,  0.995,  1.013,  0.956,  0.969,  0.686,  0.541,  0.449,  0.448,  0.442,  0.431,  0.436,  0.415,  0.424,  0.264]
