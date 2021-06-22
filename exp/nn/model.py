@@ -1,5 +1,6 @@
 import warnings
 from typing import Any
+from typing import List
 from typing import Optional
 from typing import Sequence
 from typing import Tuple
@@ -11,9 +12,7 @@ from torch import nn
 from torch.nn import functional as F
 from tqdm import tqdm
 
-from exp.nn.activation import forward_capture_context
 from exp.nn.activation import get_sampler
-from exp.nn.activation import norm_layers_context
 from exp.nn.activation import NormActivationMaker
 from exp.nn.activation import NormActivationWrapper
 from exp.nn.weights import init_weights
@@ -26,10 +25,15 @@ from exp.util.utils import print_stats
 # ========================================================================= #
 
 
-def get_ae_layer_sizes(start, mid, r=1) -> np.ndarray:
+def get_ae_layer_sizes(start, mid, r=1) -> List[int]:
     assert r >= 0
-    down = np.int32(np.linspace(start, mid, r + 1))[:-1]
-    return np.array([*down, mid, *down[::-1]], dtype='int')
+    down = np.linspace(start, mid, r + 1)[:-1]
+    return np.array([*down, mid, *down[::-1]], dtype='int').tolist()
+
+
+def get_layer_sizes(start, end, r=1) -> List[int]:
+    assert r >= 0
+    return np.array(np.linspace(start, end, r * 2 + 1), dtype='int').tolist()
 
 
 # ========================================================================= #

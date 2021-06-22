@@ -1,3 +1,4 @@
+import dataclasses
 from argparse import Namespace
 from functools import partial
 from typing import Sequence
@@ -5,6 +6,7 @@ from typing import Tuple
 from typing import Type
 from typing import Union
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import pytorch_lightning as pl
@@ -13,20 +15,23 @@ import wandb
 from flash.core.classification import ClassificationTask
 from torch import nn
 from torch.nn import functional as F
+from torch.optim import Adam
 from torch_optimizer import RAdam
 
 from exp.data import make_image_data_module
+from exp.nn.model import get_ae_layer_sizes
+from exp.nn.model import get_layer_sizes
 from exp.nn.swish import Swish
 from exp.nn.weights import init_weights
 from exp.util.nn_utils import find_submodules, replace_submodules
 from exp.util.nn_utils import in_out_capture_context
-from exp.util.nn_utils import replace_conv_and_bn
 from exp.util.pl_utils import pl_quick_train
 
 
 # ===================================================================== #
 # Layer Handling
 # ===================================================================== #
+from exp.util.utils import iter_pairs
 
 
 @torch.no_grad()
@@ -165,6 +170,61 @@ class LayerStatsHandler(object):
 # ===================================================================== #
 
 
+def std_slope(n: int, a: float, y_0: float = 0.001, y_n: float = 1.0, zero_is_flat=False, tensor=True):
+    # check bounds
+    if not ((-1 < a < 0) or (0 < a < 1)):
+        raise ValueError('a must be in the range (-1, 0) or (0, 1)')
+    # scale slope values
+    if zero_is_flat:
+        # scale slope value -> 0 is flat
+        b = (1 / (1 - a)) if (a > 0) else (1 + a)
+    else:
+        # scale slope value -> 0 is sharp
+        b = (1 / a) if (a > 0) else (-a)
+    # compute values
+    x = np.arange(n, dtype='float32')
+    m = (y_n - y_0) / (b**(n - 1) - 1)
+    y = m * (b**x - 1) + y_0
+    # return values!
+    if tensor:
+        return torch.as_tensor(y, dtype=torch.float32)
+    return y
+
+
+@dataclasses.dataclass
+class SlopeArgs:
+    #     a,   y_0,   y_1
+    # 1.  0.9   0.01 0.25
+    # 2.  0.999 0.01 0.5
+    # 3. -0.9   0.01 0.25
+    # 4. -0.5   0.01 0.25
+    a: float = 0.999
+    y_0: float = 0.01
+    y_n: float = 0.5
+
+    def to_slope(self, n: int) -> torch.Tensor:
+        return std_slope(n=n, a=self.a, y_0=self.y_0, y_n=self.y_n, zero_is_flat=False, tensor=True)
+
+
+MeanStdTargetHint = Union[float, torch.Tensor, SlopeArgs]
+
+
+def to_mean_or_std_target(n: int, target: MeanStdTargetHint) -> torch.Tensor:
+    if isinstance(target, torch.Tensor):
+        pass
+    elif isinstance(target, SlopeArgs):
+        target = target.to_slope(n)
+    else:
+        target = torch.full([n], fill_value=float(target))
+    assert target.shape == (n,)
+    return target
+
+
+# ===================================================================== #
+# Layer Regularisation
+# ===================================================================== #
+
+
 def normalize_targets(y: torch.Tensor, y_targ: torch.Tensor, model_type='classification') -> torch.Tensor:
     if model_type == 'classification':
         assert y.ndim == 2
@@ -186,8 +246,9 @@ class RegularizeLayerStatsTask(pl.LightningModule):
         layers: Sequence[nn.Module],
         model_type='regression',
         # mean & std settings
-        target_mean: Union[float, torch.Tensor] = 0.,
-        target_std: Union[float, torch.Tensor] = 1.,
+        target_mean: MeanStdTargetHint = 0.,
+        target_std: MeanStdTargetHint = 1.,
+        reg_output_with_data: bool = True,
         # early stopping
         early_stop_value: float = 0.001,
         early_stop_exp_weight: float = 0.98,
@@ -208,12 +269,8 @@ class RegularizeLayerStatsTask(pl.LightningModule):
         # normalise targets & store as paramter
         self._target_mean: torch.Tensor
         self._target_std: torch.Tensor
-        if not isinstance(target_mean, torch.Tensor): target_mean = torch.full([len(layers)], fill_value=target_mean)
-        if not isinstance(target_std, torch.Tensor): target_std = torch.full([len(layers)], fill_value=target_std)
-        self.register_buffer('_target_mean', target_mean)
-        self.register_buffer('_target_std', target_std)
-        assert self._target_mean.shape == (len(layers),)
-        assert self._target_std.shape == (len(layers),)
+        self.register_buffer('_target_mean', to_mean_or_std_target(len(layers), target_mean))
+        self.register_buffer('_target_std', to_mean_or_std_target(len(layers), target_std))
         # early stopping values
         self._early_stop_moving_ave = None
 
@@ -247,8 +304,10 @@ class RegularizeLayerStatsTask(pl.LightningModule):
         y_targ = normalize_targets(y, y_targ, model_type=self.hparams.model_type)
 
         # compute target regularize loss
-        loss_targ_mean  = F.mse_loss(y.mean(), y_targ.mean())
-        loss_targ_std   = F.mse_loss(y.std(unbiased=True), y_targ.std(unbiased=True))
+        loss_targ_mean, loss_targ_std = 0, 0
+        if self.hparams.reg_output_with_data:
+            loss_targ_mean  = F.mse_loss(y.mean(), y_targ.mean())
+            loss_targ_std   = F.mse_loss(y.std(unbiased=True), y_targ.std(unbiased=True))
         loss_layer_mean = F.mse_loss(out_mean, self._target_mean)
         loss_layer_std  = F.mse_loss(out_std,  self._target_std)
         loss = loss_layer_mean + loss_layer_std + loss_targ_mean + loss_targ_std
@@ -289,12 +348,32 @@ def has_kwarg(fn, name: str):
 # ===================================================================== #
 
 
+def _make_linear_layers(in_shape, out_shape, hidden_sizes, ActType):
+    # get sizes
+    sizes = [int(np.prod(in_shape)), *hidden_sizes, int(np.prod(out_shape))]
+    # make layers
+    return nn.Sequential(
+        nn.Flatten(),
+        *[m for inp, out in iter_pairs(sizes) for m in [nn.Linear(inp, out), ActType()]][:-1],
+        nn.Unflatten(dim=-1, unflattened_size=out_shape)
+    )
+
 def make_model(name: str, Conv2dType=nn.Conv2d, ActType=nn.ReLU):
     # activations occur inplace
     if has_kwarg(ActType, 'inplace'):
         ActType = partial(ActType, inplace=True)
     # create the model
-    if name == 'mnist_simple_conv':
+    if name == 'mnist_simple_fc_deep':
+        return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(10,), hidden_sizes=get_layer_sizes(128, 16, r=10), ActType=ActType)
+    if name == 'mnist_simple_fc_deep_wide':
+        return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(10,), hidden_sizes=get_layer_sizes(256, 64, r=10), ActType=ActType)
+    elif name == 'mnist_simple_fc':
+        return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(10,), hidden_sizes=get_layer_sizes(128, 16, r=2), ActType=ActType)
+    elif name == 'mnist_simple_fc_wide':
+        return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(10,), hidden_sizes=get_layer_sizes(256, 64, r=2), ActType=ActType)
+    # elif name == 'mnist_simple_ae_deep':
+    #     return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(1, 28, 28), hidden_sizes=get_ae_layer_sizes(128, 16, r=10), ActType=ActType)
+    elif name == 'mnist_simple_conv':
         return nn.Sequential(
             Conv2dType(1,  32, kernel_size=3, padding=1), ActType(),
             Conv2dType(32, 16, kernel_size=3, padding=1), ActType(),
@@ -346,61 +425,83 @@ def make_conv_model_and_reg_layers(name: str, Conv2dType=nn.Conv2d, ActType=nn.R
 
 
 def __main__(
-    ActType=nn.ReLU,
-    Conv2dType=nn.Conv2d,
-    init_mode: str = None,
-    WANDB = False,
+    wandb_enabled = False,
+    # model settings
+    model: str = 'simple_fc_deep',
+    model_ActType=Swish,
+    model_Conv2dType=nn.Conv2d,
+    model_init_mode: str = 'xavier_normal',
+    # dataset
+    dataset: str = 'mnist',
+    # regularisation settings
+    reg_target_mean: MeanStdTargetHint = 0.0,
+    reg_target_std: MeanStdTargetHint = 1.0,
+    reg_with_noise=True,
+    reg_output_with_data=True,
+    # optimizers
+    train_lr=1e-3,
     train_epochs=30,
-    model: str = 'simple_conv',
-    dataset: str = 'mini_imagenet'
+    train_optimizer=Adam,
 ):
     hparams = locals()
 
     model, layers = make_conv_model_and_reg_layers(
         name=f'{dataset}_{model}',
-        ActType=ActType,
-        Conv2dType=Conv2dType,
-        init_mode=init_mode,
+        ActType=model_ActType,
+        Conv2dType=model_Conv2dType,
+        init_mode=model_init_mode,
+        include_last=not reg_output_with_data,
+    )
+
+    reg_data = make_image_data_module(
+        dataset=f'noise_{dataset}' if reg_with_noise else f'{dataset}',
+        batch_size=128,
+        normalise=True,
+        return_labels=True,
     )
 
     # regularize the network
     _, _, trainer = pl_quick_train(
         system=RegularizeLayerStatsTask(
+            target_mean=reg_target_mean,
+            target_std=reg_target_std,
             model=model,
             model_type='classification',
             layers=layers,
-            optimizer=RAdam,
-            log_wandb_period=500 if WANDB else None,
-            learning_rate=3e-3,
+            optimizer=train_optimizer,
+            log_wandb_period=500 if wandb_enabled else None,
+            learning_rate=3e-3,  # this can be quite high usually
+            reg_output_with_data=reg_output_with_data,
         ),
-        data=make_image_data_module(
-            dataset=f'noise_{dataset}',
-            batch_size=128,
-            normalise=True,
-            return_labels=True,
-        ),
+        data=reg_data,
         train_epochs=100,
-        wandb_enabled=WANDB,
+        wandb_enabled=wandb_enabled,
         wandb_project='weights-test-2',
         hparams=hparams,
     )
+
+    if reg_with_noise:
+        train_data = make_image_data_module(
+            dataset=f'{dataset}',
+            batch_size=128,
+            normalise=True,
+            return_labels=True,
+        )
+    else:
+        train_data = reg_data
+    del reg_data
 
     # train the network
     _, _, _ = pl_quick_train(
         system=ClassificationTask(
             model,
             loss_fn=F.cross_entropy,
-            optimizer=RAdam,
-            learning_rate=1e-3,
+            optimizer=train_optimizer,
+            learning_rate=train_lr,
         ),
-        data=make_image_data_module(
-            dataset=f'{dataset}',
-            batch_size=128,
-            normalise=True,
-            return_labels=True,
-        ),
+        data=train_data,
         train_epochs=train_epochs,
-        wandb_enabled=WANDB,
+        wandb_enabled=wandb_enabled,
         wandb_project='weights-test-2',
         logger=trainer.logger,
     )
@@ -409,4 +510,17 @@ def __main__(
 
 
 if __name__ == '__main__':
-    __main__(WANDB=False)
+    __main__(
+        wandb_enabled=False,
+        # regularisation settings
+        reg_target_std=10.0,  # SlopeArgs(a=0.999, y_0=0.01, y_n=1.0),
+        reg_output_with_data=True,
+        reg_with_noise=False,
+        # model settings
+        model='simple_fc_deep',
+        model_ActType=Swish,
+        model_Conv2dType=nn.Conv2d,
+        model_init_mode='xavier_normal',
+        # training settings
+        train_lr=3e-4,
+    )
