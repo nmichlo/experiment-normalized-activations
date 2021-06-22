@@ -18,6 +18,8 @@ from torch.nn import functional as F
 from torch.optim import Adam
 from torch_optimizer import RAdam
 
+from nfnets import ScaledStdConv2d, WSConv2d
+
 from exp.data import make_image_data_module
 from exp.nn.model import get_ae_layer_sizes
 from exp.nn.model import get_layer_sizes
@@ -248,7 +250,7 @@ class RegularizeLayerStatsTask(pl.LightningModule):
         # mean & std settings
         target_mean: MeanStdTargetHint = 0.,
         target_std: MeanStdTargetHint = 1.,
-        reg_output_with_data: bool = True,
+        reg_model_output: bool = True,
         # early stopping
         early_stop_value: float = 0.001,
         early_stop_exp_weight: float = 0.98,
@@ -258,6 +260,7 @@ class RegularizeLayerStatsTask(pl.LightningModule):
         learning_rate: float = 1e-3,
         # logging settings
         log_wandb_period: int = None,
+        log_data_stats: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['model', 'layers'])
@@ -295,7 +298,6 @@ class RegularizeLayerStatsTask(pl.LightningModule):
             self.trainer.should_stop = True
 
     def training_step(self, x, batch_idx):
-        # TODO: this is dataset specific, special handling modes can be added?
         x, y_targ = (x, x) if isinstance(x, torch.Tensor) else x
 
         # feed forward for layer hook
@@ -303,11 +305,23 @@ class RegularizeLayerStatsTask(pl.LightningModule):
         inp_std, out_std, inp_mean, out_mean = self._layer_handler.step()
         y_targ = normalize_targets(y, y_targ, model_type=self.hparams.model_type)
 
+        # compute data stats
+        y_mean, y_std = y.mean(), y.std(unbiased=True)
+        y_targ_mean, y_targ_std = y_targ.mean(), y_targ.std(unbiased=True)
+
+        if self.hparams.log_data_stats:
+            self.log('μ_x', x.mean(),              prog_bar=True)
+            self.log('σ_x', x.std(unbiased=True),  prog_bar=True)
+            self.log('μ_y', y_mean,                prog_bar=True)
+            self.log('σ_y', y_std,                 prog_bar=True)
+            self.log('μ_t', y_targ_mean,           prog_bar=True)
+            self.log('σ_t', y_targ_std,            prog_bar=True)
+
         # compute target regularize loss
         loss_targ_mean, loss_targ_std = 0, 0
-        if self.hparams.reg_output_with_data:
-            loss_targ_mean  = F.mse_loss(y.mean(), y_targ.mean())
-            loss_targ_std   = F.mse_loss(y.std(unbiased=True), y_targ.std(unbiased=True))
+        if self.hparams.reg_model_output:
+            loss_targ_mean  = F.mse_loss(y_mean, y_targ_mean)
+            loss_targ_std   = F.mse_loss(y_std,  y_targ_std)
         loss_layer_mean = F.mse_loss(out_mean, self._target_mean)
         loss_layer_std  = F.mse_loss(out_std,  self._target_std)
         loss = loss_layer_mean + loss_layer_std + loss_targ_mean + loss_targ_std
@@ -316,10 +330,10 @@ class RegularizeLayerStatsTask(pl.LightningModule):
         self._early_stop_update(loss.item())
 
         # log everything
-        self.log('t_mu',  loss_targ_mean,  prog_bar=True)
-        self.log('t_std', loss_targ_std,   prog_bar=True)
-        self.log('l_mu',  loss_layer_mean, prog_bar=True)
-        self.log('l_std', loss_layer_std,  prog_bar=True)
+        self.log('l_σ', loss_layer_std,  prog_bar=True)
+        self.log('l_μ',  loss_layer_mean, prog_bar=True)
+        self.log('t_σ', loss_targ_std,   prog_bar=True)
+        self.log('t_μ',  loss_targ_mean,  prog_bar=True)
         self.log('train_loss', loss)
 
         # log plots
@@ -344,19 +358,23 @@ def has_kwarg(fn, name: str):
 
 
 # ===================================================================== #
-# Main
+# Models
 # ===================================================================== #
 
 
 def _make_linear_layers(in_shape, out_shape, hidden_sizes, ActType):
     # get sizes
     sizes = [int(np.prod(in_shape)), *hidden_sizes, int(np.prod(out_shape))]
+    pairs = iter_pairs(sizes)
+    # get linear layers
+    layers = [m for inp, out in pairs for m in [nn.Linear(inp, out), ActType()]][:-1]
     # make layers
     return nn.Sequential(
         nn.Flatten(),
-        *[m for inp, out in iter_pairs(sizes) for m in [nn.Linear(inp, out), ActType()]][:-1],
+        *layers,
         nn.Unflatten(dim=-1, unflattened_size=out_shape)
     )
+
 
 def make_model(name: str, Conv2dType=nn.Conv2d, ActType=nn.ReLU):
     # activations occur inplace
@@ -369,8 +387,8 @@ def make_model(name: str, Conv2dType=nn.Conv2d, ActType=nn.ReLU):
         return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(10,), hidden_sizes=get_layer_sizes(256, 64, r=10), ActType=ActType)
     elif name == 'mnist_simple_fc':
         return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(10,), hidden_sizes=get_layer_sizes(128, 16, r=2), ActType=ActType)
-    elif name == 'mnist_simple_fc_wide':
-        return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(10,), hidden_sizes=get_layer_sizes(256, 64, r=2), ActType=ActType)
+    elif name == 'mnist_simple_fc_wide':         # 850 K e:4=97.9%
+        return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(10,), hidden_sizes=get_layer_sizes(512, 128, r=2), ActType=ActType)
     # elif name == 'mnist_simple_ae_deep':
     #     return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(1, 28, 28), hidden_sizes=get_ae_layer_sizes(128, 16, r=10), ActType=ActType)
     elif name == 'mnist_simple_conv':
@@ -384,6 +402,21 @@ def make_model(name: str, Conv2dType=nn.Conv2d, ActType=nn.ReLU):
                 nn.Flatten(),
             nn.Linear(7*7*8, 128), nn.Dropout(p=0.5), ActType(),
             nn.Linear(128, 10),
+        )
+    elif name == 'mnist_simple_conv_large':
+        return nn.Sequential(
+            Conv2dType(1,  32, kernel_size=3, padding=1), ActType(),
+            Conv2dType(32, 64, kernel_size=3, padding=1), ActType(),
+                nn.AvgPool2d(kernel_size=2),  # 28x28 -> 14x14
+            Conv2dType(64, 64, kernel_size=3, padding=1), ActType(),
+            Conv2dType(64, 96, kernel_size=3, padding=1), ActType(),
+                nn.AvgPool2d(kernel_size=2),  # 14x14 -> 7x7
+            Conv2dType(96, 128, kernel_size=3, padding=1), ActType(),
+            Conv2dType(128, 96,  kernel_size=3, padding=1), ActType(),
+                nn.AvgPool2d(kernel_size=2),  # 7x7 -> 3x3
+                nn.Flatten(),
+            nn.Linear(3*3*96, 256), nn.Dropout(p=0.5), ActType(),
+            nn.Linear(256, 10),
         )
     elif name == 'mini_imagenet_simple_conv':
         return nn.Sequential(
@@ -417,11 +450,16 @@ def make_conv_model_and_reg_layers(name: str, Conv2dType=nn.Conv2d, ActType=nn.R
     if init_mode:
         init_weights(model, mode=init_mode)
     # get layers
-    layers = find_submodules(model, (Conv2dType, nn.Linear))
+    layers = find_submodules(model, (Conv2dType(1, 1, 1).__class__, nn.Linear), visit_instance_of=True)
     if not include_last:
         layers = layers[:-1]
     # return values
     return model, layers
+
+
+# ===================================================================== #
+# Main
+# ===================================================================== #
 
 
 def __main__(
@@ -434,15 +472,21 @@ def __main__(
     # dataset
     dataset: str = 'mnist',
     # regularisation settings
+    regularize: bool = True,
     reg_target_mean: MeanStdTargetHint = 0.0,
     reg_target_std: MeanStdTargetHint = 1.0,
     reg_with_noise=True,
-    reg_output_with_data=True,
+    reg_model_output=True,
     # optimizers
     reg_lr=1e-3,
+    reg_batch_size=128,
     train_lr=1e-3,
+    train_batch_size=128,
     train_epochs=30,
     train_optimizer=Adam,
+    # schedule
+    train_scheduler=None,
+    train_scheduler_kwargs=None,
 ):
     hparams = locals()
 
@@ -451,46 +495,40 @@ def __main__(
         ActType=model_ActType,
         Conv2dType=model_Conv2dType,
         init_mode=model_init_mode,
-        include_last=not reg_output_with_data,
+        include_last=not reg_model_output,
     )
 
-    reg_data = make_image_data_module(
-        dataset=f'noise_{dataset}' if reg_with_noise else f'{dataset}',
-        batch_size=128,
-        normalise=True,
-        return_labels=True,
-    )
+    print(f'REG LAYERS: {len(layers)}')
 
-    # regularize the network
-    _, _, trainer = pl_quick_train(
-        system=RegularizeLayerStatsTask(
-            target_mean=reg_target_mean,
-            target_std=reg_target_std,
-            model=model,
-            model_type='classification',
-            layers=layers,
-            optimizer=train_optimizer,
-            log_wandb_period=500 if wandb_enabled else None,
-            learning_rate=reg_lr,
-            reg_output_with_data=reg_output_with_data,
-        ),
-        data=reg_data,
-        train_epochs=100,
-        wandb_enabled=wandb_enabled,
-        wandb_project='weights-test-2',
-        hparams=hparams,
-    )
-
-    if reg_with_noise:
-        train_data = make_image_data_module(
-            dataset=f'{dataset}',
-            batch_size=128,
-            normalise=True,
+    trainer = None
+    if regularize:
+        reg_data = make_image_data_module(
+            dataset=f'noise_{dataset}' if reg_with_noise else f'{dataset}',
+            batch_size=reg_batch_size,
+            shift_mean_std=True,
             return_labels=True,
         )
-    else:
-        train_data = reg_data
-    del reg_data
+        # regularize the network
+        _, _, trainer = pl_quick_train(
+            system=RegularizeLayerStatsTask(
+                target_mean=reg_target_mean,
+                target_std=reg_target_std,
+                model=model,
+                model_type='classification',
+                layers=layers,
+                optimizer=train_optimizer,
+                log_wandb_period=500 if wandb_enabled else None,
+                learning_rate=reg_lr,
+                reg_model_output=reg_model_output,
+                log_data_stats=False,
+            ),
+            data=reg_data,
+            train_epochs=100,
+            wandb_enabled=wandb_enabled,
+            wandb_project='weights-test-2',
+            hparams=hparams,
+        )
+        del reg_data, _
 
     # train the network
     _, _, _ = pl_quick_train(
@@ -499,30 +537,47 @@ def __main__(
             loss_fn=F.cross_entropy,
             optimizer=train_optimizer,
             learning_rate=train_lr,
+            scheduler=train_scheduler,
+            scheduler_kwargs=train_scheduler_kwargs,
         ),
-        data=train_data,
+        data=make_image_data_module(
+            dataset=f'{dataset}',
+            batch_size=train_batch_size,
+            shift_mean_std=True,
+            return_labels=True,
+        ),
         train_epochs=train_epochs,
         wandb_enabled=wandb_enabled,
         wandb_project='weights-test-2',
-        logger=trainer.logger,
+        logger=trainer.logger if (trainer is not None) else None,
     )
-
+    del _
     return model
 
 
 if __name__ == '__main__':
+
+    # 99% validation accuracy: Epoch 4
+
+    gamma = compute_gamma(Swish())
+
     __main__(
         wandb_enabled=False,
         # regularisation settings
-        reg_target_std=2.0,  # SlopeArgs(a=0.999, y_0=0.01, y_n=1.0),
-        reg_output_with_data=True,
+        # NOTE: no reg seems to be better unfortunately -- just use ScaledStdConv2d with xavier_normal init
+        regularize=False,
+        reg_target_std=1.0,  # SlopeArgs(a=0.999, y_0=0.1, y_n=1.0),
         reg_with_noise=True,
+        reg_model_output=False,
         # model settings
-        model='simple_fc_deep_wide',
+        model='simple_conv_large',
         model_ActType=Swish,
-        model_Conv2dType=nn.Conv2d,
+        model_Conv2dType=lambda *args, **kwargs: ScaledStdConv2d(*args, **kwargs, gamma=gamma, use_layernorm=True),
         model_init_mode='xavier_normal',
         # training settings
         reg_lr=1e-3,
         train_lr=3e-4,
+        # scheduler
+        train_scheduler=torch.optim.lr_scheduler.MultiStepLR,
+        train_scheduler_kwargs=dict(gamma=0.5, milestones=[4, 8], verbose=True),
     )

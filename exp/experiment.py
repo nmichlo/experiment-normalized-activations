@@ -179,7 +179,7 @@ class SimpleSystem(pl.LightningModule):
             )
 
         # get the data
-        data = make_image_data_module(dataset=dataset, batch_size=batch_size, normalise=True)
+        data = make_image_data_module(dataset=dataset, batch_size=batch_size, shift_mean_std=True)
 
         # make the model
         model = cls(

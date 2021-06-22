@@ -9,6 +9,7 @@ from torch import nn
 
 
 _WEIGHT_INIT_MODES = {
+    'none': lambda x: None,
     'default': lambda x: None,
     'uniform': torch.nn.init.uniform_,
     'normal': torch.nn.init.normal_,
