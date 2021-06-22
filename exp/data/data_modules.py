@@ -15,7 +15,6 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 import torchvision
-from PIL.Image import Image
 from pytorch_lightning.core.saving import ALLOWED_CONFIG_TYPES
 from pytorch_lightning.core.saving import PRIMITIVE_TYPES
 from pytorch_lightning.utilities import AttributeDict
@@ -25,7 +24,6 @@ from torch.utils.data import Dataset
 from torch.utils.data import IterableDataset
 from torch.utils.data import random_split
 from torchvision.datasets import MNIST
-from torchvision.transforms.functional import to_tensor
 
 from exp.nn.activation import get_sampler
 
@@ -55,14 +53,6 @@ def split_ratios(length, ratios=(0.7, 0.15, 0.15)):
         sizes.append(size)
     assert sum(sizes) == length
     return sizes
-
-
-class ToTensor(object):
-    def __call__(self, x):
-        if isinstance(x, Image):
-            x = to_tensor(x)
-        assert x.dtype == torch.float32
-        return x
 
 
 # ========================================================================= #
@@ -151,7 +141,7 @@ class ImageDataModule(HparamDataModule):
         self._has_setup = True
         # get image normalise transform
         transform = torchvision.transforms.Compose([
-            ToTensor(),
+            torchvision.transforms.ToTensor(),
             torchvision.transforms.Normalize(*self.shift_mean_std)
         ])
         # load data
@@ -210,8 +200,9 @@ class NoiseDataset(IterableDataset):
         transform=None,
         transform_label=None,
     ):
-        self._sampler = get_sampler(sampler)
-        self._obs_shape = obs_shape
+        C, H, W = obs_shape
+        self._img_shape = (H, W, C)
+        self._sampler = get_sampler(sampler, tensor=False)
         self._return_labels = return_labels
         self._num_labels = num_labels
         self._length = length
@@ -226,7 +217,7 @@ class NoiseDataset(IterableDataset):
         # yield all values!
         for i in counter:
             # handle obs
-            obs = self._sampler(*self._obs_shape, dtype=torch.float32, device=None)
+            obs = self._sampler(*self._img_shape)
             if self._transform is not None:
                 obs = self._transform(obs)
             # return obs
@@ -487,11 +478,11 @@ class ImageNetMiniDataModule(ImageDataModule):
 
 
 _DATA_MEAN_STD = {
-    'mnist':                       (0.1306604762738431, 0.3081078038564622),
+    'mnist':                       (0.1306604762738431, 0.3081078038564622),  # TODO: verify this!
     'noise_mnist':                 (0., 1.),
     'noise_mnist_normal':          (0., 1.),
     'noise_mnist_uniform':         (0., 1.),
-    # 'mini_imagenet':             (..., ...), # TODO!
+    'mini_imagenet':               (0.5, 0.5),  # TODO: THIS IS WRONG!
     'noise_mini_imagenet':         (0., 1.),
     'noise_mini_imagenet_normal':  (0., 1.),
     'noise_mini_imagenet_uniform': (0., 1.),

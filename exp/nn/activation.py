@@ -29,13 +29,16 @@ _SAMPLERS = {
     'suniform': lambda *shape, dtype=torch.float32, device=None: torch.rand(*shape,  dtype=dtype, device=device) * 2 - 1,
 }
 
+_NP_SAMPLERS = {
+    # numpy samplers
+    'normal':   lambda *shape: np.random.randn(*shape).astype('float32'),
+    'uniform':  lambda *shape: np.random.rand(*shape).astype('float32'),
+    'suniform': lambda *shape: np.random.rand(*shape).astype('float32') * 2 - 1,
+}
 
-def get_sampler(sampler: Union[str, callable] = 'normal'):
-    if isinstance(sampler, str):
-        sampler = _SAMPLERS[sampler]
-    else:
-        assert callable(sampler)
-    return sampler
+
+def get_sampler(sampler: str = 'normal', tensor=True):
+    return _SAMPLERS[sampler] if tensor else _NP_SAMPLERS[sampler]
 
 
 # ========================================================================= #

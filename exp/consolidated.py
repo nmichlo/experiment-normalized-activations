@@ -386,21 +386,12 @@ class RandomLinear(nn.Linear):
 # ===================================================================== #
 
 
-def _make_linear_layers(in_shape, out_shape, hidden_sizes, ActType, random_idxs_p: Union[dict, float] = None):
+def _make_linear_layers(in_shape, out_shape, hidden_sizes, ActType):
     # get sizes
     sizes = [int(np.prod(in_shape)), *hidden_sizes, int(np.prod(out_shape))]
     pairs = iter_pairs(sizes)
     # get linear layers
     layers = [m for inp, out in pairs for m in [nn.Linear(inp, out), ActType()]][:-1]
-    # replace layers with random linear layers:
-    if random_idxs_p is not None:
-        if isinstance(random_idxs_p, (float)):
-            random_idxs_p = {i: random_idxs_p for i in range(len(pairs))}
-        elif isinstance(random_idxs_p, (tuple, list)):
-            assert len(random_idxs_p) == len(sizes)
-            random_idxs_p = dict(enumerate(random_idxs_p))
-        for i, p in random_idxs_p.items():
-            layers[i*2] = RandomLinear(layers[i*2].in_features, layers[i*2].out_features, p=p)
     # make layers
     return nn.Sequential(
         nn.Flatten(),
@@ -422,8 +413,6 @@ def make_model(name: str, Conv2dType=nn.Conv2d, ActType=nn.ReLU):
         return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(10,), hidden_sizes=get_layer_sizes(128, 16, r=2), ActType=ActType)
     elif name == 'mnist_simple_fc_wide':         # 850 K e:4=97.9%
         return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(10,), hidden_sizes=get_layer_sizes(512, 128, r=2), ActType=ActType)
-    elif name == 'mnist_simple_fc_wide_random':  # 224 K e:4=96.5%
-        return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(10,), hidden_sizes=get_layer_sizes(512, 128, r=2), ActType=ActType,  random_idxs_p={0: 0.15, 1: 0.25, 2: 0.333, 3: 0.5})
     # elif name == 'mnist_simple_ae_deep':
     #     return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(1, 28, 28), hidden_sizes=get_ae_layer_sizes(128, 16, r=10), ActType=ActType)
     elif name == 'mnist_simple_conv':
@@ -600,19 +589,22 @@ if __name__ == '__main__':
         wandb_enabled=False,
         # regularisation settings
         # NOTE: no reg seems to be better unfortunately -- just use ScaledStdConv2d with xavier_normal init
-        regularize=False,
+        regularize=True,
         reg_target_std=1.0,  # SlopeArgs(a=0.999, y_0=0.1, y_n=1.0),
         reg_with_noise=True,
         reg_model_output=False,
         # model settings
-        model='simple_conv_large',
+        dataset='mini_imagenet',
+        model='simple_conv',
         model_ActType=Swish,
         model_Conv2dType=lambda *args, **kwargs: ScaledStdConv2d(*args, **kwargs, gamma=gamma, use_layernorm=True),
         model_init_mode='xavier_normal',
         # training settings
         reg_lr=1e-3,
         train_lr=3e-4,
+        train_batch_size=128,
+        train_epochs=100,
         # scheduler
         train_scheduler=torch.optim.lr_scheduler.MultiStepLR,
-        train_scheduler_kwargs=dict(gamma=0.5, milestones=[4, 8], verbose=True),
+        train_scheduler_kwargs=dict(gamma=0.5, milestones=[25, 50], verbose=True),
     )
