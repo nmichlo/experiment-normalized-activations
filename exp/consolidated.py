@@ -358,16 +358,49 @@ def has_kwarg(fn, name: str):
 
 
 # ===================================================================== #
+# Modules
+# ===================================================================== #
+
+
+class RandomLinear(nn.Linear):
+
+    def __init__(self, in_features: int, out_features: int, p: float = 0.5):
+        assert 0 < p <= 1
+        # modify values
+        p_in = int(max(in_features * p, 1))
+        # initialise
+        super().__init__(p_in, out_features)
+        # create random values
+        self.shuffle_idxs: torch.Tensor
+        self.register_buffer('shuffle_idxs', torch.randint(0, in_features, size=(out_features, p_in)))
+
+    def forward(self, x: torch.Tensor):
+        assert x.ndim == 2
+        x = x[:, self.shuffle_idxs]
+        y = (x * self.weight[None]).sum(dim=-1) + self.bias
+        return y
+
+
+# ===================================================================== #
 # Models
 # ===================================================================== #
 
 
-def _make_linear_layers(in_shape, out_shape, hidden_sizes, ActType):
+def _make_linear_layers(in_shape, out_shape, hidden_sizes, ActType, random_idxs_p: Union[dict, float] = None):
     # get sizes
     sizes = [int(np.prod(in_shape)), *hidden_sizes, int(np.prod(out_shape))]
     pairs = iter_pairs(sizes)
     # get linear layers
     layers = [m for inp, out in pairs for m in [nn.Linear(inp, out), ActType()]][:-1]
+    # replace layers with random linear layers:
+    if random_idxs_p is not None:
+        if isinstance(random_idxs_p, (float)):
+            random_idxs_p = {i: random_idxs_p for i in range(len(pairs))}
+        elif isinstance(random_idxs_p, (tuple, list)):
+            assert len(random_idxs_p) == len(sizes)
+            random_idxs_p = dict(enumerate(random_idxs_p))
+        for i, p in random_idxs_p.items():
+            layers[i*2] = RandomLinear(layers[i*2].in_features, layers[i*2].out_features, p=p)
     # make layers
     return nn.Sequential(
         nn.Flatten(),
@@ -389,6 +422,8 @@ def make_model(name: str, Conv2dType=nn.Conv2d, ActType=nn.ReLU):
         return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(10,), hidden_sizes=get_layer_sizes(128, 16, r=2), ActType=ActType)
     elif name == 'mnist_simple_fc_wide':         # 850 K e:4=97.9%
         return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(10,), hidden_sizes=get_layer_sizes(512, 128, r=2), ActType=ActType)
+    elif name == 'mnist_simple_fc_wide_random':  # 224 K e:4=96.5%
+        return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(10,), hidden_sizes=get_layer_sizes(512, 128, r=2), ActType=ActType,  random_idxs_p={0: 0.15, 1: 0.25, 2: 0.333, 3: 0.5})
     # elif name == 'mnist_simple_ae_deep':
     #     return _make_linear_layers(in_shape=(1, 28, 28), out_shape=(1, 28, 28), hidden_sizes=get_ae_layer_sizes(128, 16, r=10), ActType=ActType)
     elif name == 'mnist_simple_conv':
