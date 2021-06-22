@@ -75,7 +75,7 @@ def init_weights(model: nn.Module, mode='xavier_normal', verbose=False) -> nn.Mo
 # ========================================================================= #
 
 
-@register_weight_initializer('custom')
+@register_weight_initializer('custom_normal')
 def _custom_weight_init(weight: torch.Tensor):
     assert weight.ndim == 2, f'custom initializer only works with weights with 2 dimensions, got: {weight.shape}'
     out, inp = weight.shape
@@ -83,7 +83,7 @@ def _custom_weight_init(weight: torch.Tensor):
         weight.normal_(0., np.sqrt(1 / inp))
 
 
-@register_weight_initializer('custom_alt')
+@register_weight_initializer('custom_normal_alt')
 def _custom_alt_weight_init(weight: torch.Tensor):
     assert weight.ndim == 2, f'custom_alt initializer only works with weights with 2 dimensions, got: {weight.shape}'
     out, inp = weight.shape

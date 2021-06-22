@@ -11,16 +11,20 @@ import pandas as pd
 import plotly.express as px
 import pytorch_lightning as pl
 import torch
+import torch_optimizer
 import wandb
 from flash.core.classification import ClassificationTask
 from torch import nn
 from torch.nn import functional as F
 from torch.optim import Adam
+from torch.optim import Adamax
 from torch_optimizer import RAdam
 
 from nfnets import ScaledStdConv2d, WSConv2d
 
 from exp.data import make_image_data_module
+from exp.nn.activation import Activation
+from exp.nn.activation import ActivationMaker
 from exp.nn.model import get_ae_layer_sizes
 from exp.nn.model import get_layer_sizes
 from exp.nn.swish import Swish
@@ -41,7 +45,7 @@ def compute_gamma(activation_fn, batch_size=1024, samples=256):
     # from appendix D: https://arxiv.org/pdf/2101.08692.pdf
     y = activation_fn(torch.randn(batch_size, samples))
     gamma = torch.mean(torch.var(y, dim=1))**-0.5
-    return gamma
+    return gamma.item()
 
 
 class MeanShift(nn.Module):
@@ -487,11 +491,12 @@ def make_conv_model_and_reg_layers(name: str, Conv2dType=nn.Conv2d, ActType=nn.R
 
 
 def __main__(
-    wandb_enabled = False,
+    wandb_enabled: bool = False,
+    wandb_project: str = 'weights-test',
     # model settings
     model: str = 'simple_fc_deep',
-    model_ActType=Swish,
-    model_Conv2dType=nn.Conv2d,
+    model_activation: str = 'swish',
+    model_conv_type: str = 'conv',
     model_init_mode: str = 'xavier_normal',
     # dataset
     dataset: str = 'mnist',
@@ -502,22 +507,28 @@ def __main__(
     reg_with_noise=True,
     reg_model_output=True,
     # optimizers
-    reg_lr=1e-3,
-    reg_batch_size=128,
-    train_lr=1e-3,
-    train_batch_size=128,
-    train_epochs=30,
-    train_optimizer=Adam,
+    reg_lr: float = 1e-3,
+    reg_batch_size: int = 128,
+    train_lr: float = 1e-3,
+    train_batch_size: int = 128,
+    train_epochs: int = 30,
+    train_optimizer: Type[torch.optim.Optimizer] = Adam,
+    train_optimizer_kwargs=None,
     # schedule
     train_scheduler=None,
     train_scheduler_kwargs=None,
 ):
     hparams = locals()
 
+    # strings to types
+    model_activation = ActivationMaker(activation=activation)
+    model_conv_type = get_conv_type(conv_type=conv_type, activation=activation)
+
+    # make the model
     model, layers = make_conv_model_and_reg_layers(
         name=f'{dataset}_{model}',
-        ActType=model_ActType,
-        Conv2dType=model_Conv2dType,
+        ActType=model_activation,
+        Conv2dType=model_conv_type,
         init_mode=model_init_mode,
         include_last=not reg_model_output,
     )
@@ -541,6 +552,7 @@ def __main__(
                 model_type='classification',
                 layers=layers,
                 optimizer=train_optimizer,
+                optimizer_kwargs=train_optimizer_kwargs if train_optimizer_kwargs else {},
                 log_wandb_period=500 if wandb_enabled else None,
                 learning_rate=reg_lr,
                 reg_model_output=reg_model_output,
@@ -560,6 +572,7 @@ def __main__(
             model,
             loss_fn=F.cross_entropy,
             optimizer=train_optimizer,
+            optimizer_kwargs=train_optimizer_kwargs if train_optimizer_kwargs else {},
             learning_rate=train_lr,
             scheduler=train_scheduler,
             scheduler_kwargs=train_scheduler_kwargs,
@@ -572,39 +585,57 @@ def __main__(
         ),
         train_epochs=train_epochs,
         wandb_enabled=wandb_enabled,
-        wandb_project='weights-test-2',
+        wandb_project=wandb_project,
         logger=trainer.logger if (trainer is not None) else None,
     )
     del _
     return model
 
 
+def get_conv_type(conv_type: str, activation: str):
+    # compute gamma for ScaledStdConv2d
+    gamma = compute_gamma(Activation(activation))
+    print('\033[93m', 'GAMMA: ', gamma, '\033[0m', sep='')
+    # get the conv maker
+    if conv_type == 'scaled_conv':
+        return lambda *args, **kwargs: ScaledStdConv2d(*args, **kwargs, gamma=gamma, use_layernorm=True)
+    elif conv_type == 'conv':
+        return nn.Conv2d
+    else:
+        raise KeyError(f'invalid conv_type: {repr(conv_type)}')
+
+
 if __name__ == '__main__':
 
-    # 99% validation accuracy: Epoch 4
+    # 99.6 % after 3rd epoch
+    # 99.7 % after ~15-20 epochs
 
-    gamma = compute_gamma(Swish())
+    activation = 'swish'
+    conv_type = 'scaled_conv'
+    init_mode = 'xavier_normal'
 
     __main__(
         wandb_enabled=False,
+        # model settings
+        dataset='mnist',
+        model='simple_conv_large',
+        model_activation='norm_swish',
+        model_conv_type='scaled_conv',
+        model_init_mode='xavier_normal',
         # regularisation settings
         # NOTE: no reg seems to be better unfortunately -- just use ScaledStdConv2d with xavier_normal init
-        regularize=True,
-        reg_target_std=1.0,  # SlopeArgs(a=0.999, y_0=0.1, y_n=1.0),
-        reg_with_noise=True,
-        reg_model_output=False,
-        # model settings
-        dataset='mini_imagenet',
-        model='simple_conv',
-        model_ActType=Swish,
-        model_Conv2dType=lambda *args, **kwargs: ScaledStdConv2d(*args, **kwargs, gamma=gamma, use_layernorm=True),
-        model_init_mode='xavier_normal',
-        # training settings
+        regularize=False,
         reg_lr=1e-3,
-        train_lr=3e-4,
-        train_batch_size=128,
+        reg_target_std=1.0,  # SlopeArgs(a=0.999, y_0=0.1, y_n=1.0),
+        reg_with_noise=False,
+        reg_model_output=True,
+        # training settings
+        train_lr=1e-3,
         train_epochs=100,
+        train_optimizer=torch_optimizer.AdaBelief,  # Adam, RAdam,
+        # train_optimizer_kwargs=dict(eps=1e-5, weight_decay=1e-5),
+        # train_optimizer_kwargs=dict(eps=1e-5, weight_decay=1e-5),
         # scheduler
         train_scheduler=torch.optim.lr_scheduler.MultiStepLR,
-        train_scheduler_kwargs=dict(gamma=0.5, milestones=[25, 50], verbose=True),
+        train_scheduler_kwargs=dict(gamma=10**(-0.5), milestones=[1, 2, 3, 10], verbose=True),
     )
