@@ -11,20 +11,7 @@ from typing import Type
 from typing import Union
 
 import torch
-from pytorch_lightning.utilities import AttributeDict
 from torch import nn
-
-
-# def module_apply(
-#     module: nn.Module,
-#     fn: Callable[[Optional[nn.Module], Optional[str], nn.Module], None],
-# ):
-#     def _recurse(parent, key, child: nn.Module):
-#         fn(parent, key, child)
-#         for k, v in child.named_children():
-#             _recurse(child, k, v)
-#     _recurse(None, None, module)
-#     return module
 
 
 VisitTypesHint = Union[Type[nn.Module], Tuple[Type[nn.Module], ...]]

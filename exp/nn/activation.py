@@ -77,94 +77,6 @@ def to_norm_activation_fn(activation_fn=None, num_samples=16384, device=None, dt
 
 
 # ========================================================================= #
-# Norm NormActivation Class                                                     #
-# ========================================================================= #
-
-
-class NormActivationWrapper(nn.Module):
-
-    def __init__(self, activation: nn.Module, init_samples: Optional[int] = None, init_sampler: Optional[str] = 'normal', can_optimize: bool = True):
-        super().__init__()
-        # save the activation
-        assert isinstance(activation, nn.Module), f'activation is not an instance of nn.Module, got: {type(activation)}'
-        self._activation = activation
-        # can_optimize
-        # compute mean and std
-        if (init_samples is None) or (init_sampler is None):
-            mean, std = 0, 1
-        else:
-            mean, std = compute_activation_norms(activation, num_samples=init_samples, dtype=torch.float32, sampler=init_sampler)
-        # initialise values
-        mean = nn.Parameter(torch.as_tensor(mean, dtype=torch.float32), requires_grad=False)
-        std  = nn.Parameter(torch.as_tensor(std,  dtype=torch.float32), requires_grad=False)
-        # save values
-        self._can_optimize = can_optimize
-        if can_optimize:
-            self.register_parameter('_mean', mean)
-            self.register_parameter('_std', std)
-        else:
-            # buffers are saved along with the model, but cannot receive a gradient
-            self.register_buffer('_mean', mean, persistent=True)
-            self.register_buffer('_std', std, persistent=True)
-        # checks
-        assert self._mean.shape == ()
-        assert self._std.shape == ()
-
-    def forward(self, x):
-        return (self._activation(x) - self._mean) / self._std
-
-    @property
-    def can_optimize(self):
-        return self._can_optimize
-
-    # @property
-    # def __name__(self):
-    #     return f"norm_{getattr(self._activation, '__name__', self._activation)}".lower()
-    #
-    # def __str__(self):
-    #     return self.__name__
-
-    def __repr__(self):
-        activation = getattr(self._activation, '__name__', self._activation)
-        return f'{self.__class__.__name__}(activation={activation}, can_optimize={self.can_optimize})'
-
-    def freeze(self):
-        try:
-            mean = self.get_parameter('_mean')
-            std = self.get_parameter('_std')
-            # delete parameters
-            del self._mean
-            del self._std
-            # register as buffer instead
-            self.register_buffer('_mean', mean.requires_grad_(False), persistent=True)
-            self.register_buffer('_std', std.requires_grad_(False), persistent=True)
-        except AttributeError:
-            pass
-
-    @property
-    def values(self):
-        return [self._mean.item(), self._std.item()]
-
-    @classmethod
-    def recursive_get_from_module(cls, model: nn.Module, mode: str = 'all'):
-        allowed_states = {'all': [True, False], 'unoptimizable': [False], 'optimizable': [True]}[mode]
-        layers = []
-
-        def _collect(m):
-            if isinstance(m, cls):
-                if m.can_optimize in allowed_states:
-                    layers.append(m)
-
-        model.apply(_collect)
-        return layers
-
-    @classmethod
-    def recursive_freeze(cls, model: nn.Module):
-        for layer in cls.recursive_get_from_module(model):
-            layer.freeze()
-
-
-# ========================================================================= #
 # Activations                                                               #
 # ========================================================================= #
 
@@ -220,66 +132,28 @@ ACTIVATION_CLASSES = {
 }
 
 
-def NormActivation(activation: str = 'norm_tanh', norm_samples: Optional[int] = None, norm_sampler: str = 'normal') -> NormActivationWrapper:
-    # should normalise or not
-    sample = False
-    if activation.startswith('norm_'):
-        sample = True
-        activation = activation[len('norm_'):]
-    # make new activation class
-    activation = ACTIVATION_CLASSES[activation]()
-    # instantiate NormActivation
-    if sample:
-        return NormActivationWrapper(activation, init_samples=norm_samples, init_sampler=norm_sampler, can_optimize=True)
+class GenericActivation(nn.Module):
+
+    def __init__(self, activation_fn):
+        super().__init__()
+        self.activation_fn = activation_fn
+
+    def __repr__(self):
+        return f'GenericActivation({getattr(self.activation_fn, "__name__", self.activation_fn)})'
+
+    def forward(self, x):
+        return self.activation_fn(x)
+
+
+def Activation(activation: str = 'norm_tanh') -> nn.Module:
+    if activation in ACTIVATION_CLASSES:
+        return ACTIVATION_CLASSES[activation]()
     else:
-        return NormActivationWrapper(activation, init_samples=None,         init_sampler=None,         can_optimize=False)
+        return GenericActivation(ACTIVATIONS[activation])
 
 
-def NormActivationMaker(activation: str = 'norm_swish', norm_samples: Optional[int] = None, norm_sampler: str = 'normal') -> Callable[[int, int, int], NormActivationWrapper]:
-    return lambda i, inp, out: NormActivation(activation=activation, norm_samples=norm_samples, norm_sampler=norm_sampler)
-
-
-# ========================================================================= #
-# Norm Layers Hooks                                                         #
-# ========================================================================= #
-
-
-@contextlib.contextmanager
-def norm_layers_context(model: nn.Module, mode='all', set_optimizable=False):
-    # get layers
-    norm_layers = tuple(NormActivationWrapper.recursive_get_from_module(model, mode=mode))
-    # set optimizable
-    for layer in norm_layers:
-        layer.requires_grad_(set_optimizable)
-    # return layers
-    try:
-        yield norm_layers
-    finally:
-        # unset optimizable
-        for layer in norm_layers:
-            layer.requires_grad_(False)
-
-
-@contextlib.contextmanager
-def forward_capture_context(layers: Sequence[nn.Module]) -> List[torch.Tensor]:
-    # initialise capture hook
-    stack = []
-    def hook(module, input, output) -> None:
-        if len(stack) >= len(layers):
-            raise RuntimeError('stack was not cleared before next feed forward')
-        stack.append(output)
-    # register hooks
-    handles = [layer.register_forward_hook(hook) for layer in layers]
-    # yield stack
-    try:
-        yield stack
-    finally:
-        if len(stack) != 0:
-            warnings.warn('stack was not cleared before context was exited.')
-        stack.clear()
-        # unregister hooks
-        for handle in handles:
-            handle.remove()
+def ActivationMaker(activation: str = 'norm_tanh'):
+    return lambda: Activation(activation)
 
 
 # ========================================================================= #
