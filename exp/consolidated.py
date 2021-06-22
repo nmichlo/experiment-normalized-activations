@@ -439,6 +439,7 @@ def __main__(
     reg_with_noise=True,
     reg_output_with_data=True,
     # optimizers
+    reg_lr=1e-3,
     train_lr=1e-3,
     train_epochs=30,
     train_optimizer=Adam,
@@ -470,7 +471,7 @@ def __main__(
             layers=layers,
             optimizer=train_optimizer,
             log_wandb_period=500 if wandb_enabled else None,
-            learning_rate=3e-3,  # this can be quite high usually
+            learning_rate=reg_lr,
             reg_output_with_data=reg_output_with_data,
         ),
         data=reg_data,
@@ -513,14 +514,15 @@ if __name__ == '__main__':
     __main__(
         wandb_enabled=False,
         # regularisation settings
-        reg_target_std=10.0,  # SlopeArgs(a=0.999, y_0=0.01, y_n=1.0),
+        reg_target_std=2.0,  # SlopeArgs(a=0.999, y_0=0.01, y_n=1.0),
         reg_output_with_data=True,
-        reg_with_noise=False,
+        reg_with_noise=True,
         # model settings
-        model='simple_fc_deep',
+        model='simple_fc_deep_wide',
         model_ActType=Swish,
         model_Conv2dType=nn.Conv2d,
         model_init_mode='xavier_normal',
         # training settings
+        reg_lr=1e-3,
         train_lr=3e-4,
     )
